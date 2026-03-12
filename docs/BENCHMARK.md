@@ -93,3 +93,67 @@ Each run writes to `benchmark/results/YYYYMMDD-HHMMSS/`:
 | `benchmark-results.json` | Structured JSON with per-turn prompts, responses, timings, and exit codes |
 | `transcript.md` | Human-readable markdown showing prompts and responses side-by-side |
 | `report.html` | Self-contained HTML report with dark theme, collapsible turns, and summary stats |
+
+## Daily-Memory Retrieval Benchmark
+
+The `benchmark/daily-memory/` harness evaluates mem9 retrieval quality against a synthetic corpus of daily markdown memory files. Unlike the A/B benchmark above, it uses **raw memory writes** and **rule-based scoring** with no LLM dependency.
+
+The harness generates a deterministic corpus (default: 365 days, ~1000 words/day) with 28 recurring topic families, ingests entries into mem9, and evaluates retrieval across five question categories: exact attribute, paraphrase, temporal, multi-hop, and negative.
+
+```bash
+cd benchmark/daily-memory
+npm install
+MEM9_TENANT_ID=your-space-id npm run start
+```
+
+See [`benchmark/daily-memory/USAGE.md`](../benchmark/daily-memory/USAGE.md) for full setup and CLI options.
+
+## Daily-Memory E2E Benchmark
+
+The `benchmark/scripts/daily-memory-e2e.sh` harness extends the daily-memory benchmark into a full **end-to-end** comparison using live OpenClaw agent calls. It compares two memory approaches:
+
+- **Profile A (baseline):** Daily markdown files placed in the agent's workspace. The agent uses native file reading and search to answer questions.
+- **Profile B (treatment):** The same corpus ingested into mem9 via the **smart-ingest pipeline** (messages-based, `mode: "smart"`). The agent uses the mem9 plugin for recall.
+
+Both profiles receive identical questions and are scored with the same 5-category rule-based evaluation (exact, paraphrase, temporal, multi-hop, negative). Each question runs in a **fresh session** to prevent answer contamination.
+
+### Running
+
+```bash
+export CLAUDE_CODE_TOKEN=...
+bash benchmark/scripts/daily-memory-e2e.sh
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEM9_BASE_URL` | `https://api.mem9.ai` | mem9 API endpoint |
+| `BENCH_DM_SEED` | `42` | Corpus generation seed |
+| `BENCH_DM_DAYS` | `30` | Number of daily entries to generate |
+| `BENCH_DM_TOPICS` | `10` | Number of topic families |
+| `BENCH_DM_WORDS` | `200` | Words per daily entry |
+| `BENCH_DM_MAX_QUESTIONS` | `20` | Max questions (balanced across categories) |
+| `BENCH_DM_TIMEOUT` | `120` | Per-question timeout in seconds |
+| `BENCH_DM_CORPUS_DIR` | (auto) | Reuse an existing generated corpus directory |
+
+### Pipeline
+
+1. **Generate corpus** — reuses the `daily-memory` generator via tsx
+2. **Provision mem9 space** — fresh space per run
+3. **Create profiles** — Profile A (vanilla) and Profile B (mem9 plugin)
+4. **Workspace setup** — daily files copied to A's workspace only; shared context to both
+5. **Smart-ingest** — corpus ingested into mem9 for Profile B via `POST /memories` with `mode: "smart"`
+6. **Start gateways** — both OpenClaw gateways launched and health-checked
+7. **Drive questions** — each question sent to both profiles in parallel with fresh sessions
+8. **Score and report** — rule-based scoring, JSON results, markdown transcript, HTML report
+
+### Output
+
+Each run writes to `benchmark/results/dm-e2e-YYYYMMDD-HHMMSS/`:
+
+| File | Description |
+|---|---|
+| `benchmark-results.json` | Per-question scores for both profiles, aggregate stats |
+| `transcript.md` | Human-readable side-by-side comparison |
+| `report.html` | Self-contained HTML report with category breakdown and per-question detail |
