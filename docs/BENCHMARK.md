@@ -2,7 +2,7 @@
 
 ## Overview
 
-Run the top-level A/B benchmark directly with:
+Run the top-level A/B benchmark with:
 
 ```bash
 bash benchmark/scripts/benchmark.sh
