@@ -17,6 +17,10 @@ GATEWAY_TOKEN="bench-token-123456"
 BENCH_PROMPT_FILE="${BENCH_PROMPT_FILE:-}"
 PROMPT_TIMEOUT="${BENCH_PROMPT_TIMEOUT:-600}"
 
+# Clean up legacy profile names from older runs too.
+LEGACY_PROFILE_A="mnemos_test_a"
+LEGACY_PROFILE_B="mnemos_test_b"
+
 # ---------------------------------------------------------------------------
 # Preflight checks
 # ---------------------------------------------------------------------------
