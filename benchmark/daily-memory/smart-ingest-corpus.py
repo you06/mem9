@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-smart-ingest-corpus.py — Ingest daily-memory corpus into mem9 via the smart-ingest API.
+smart-ingest-corpus.py — Ingest daily-memory corpus into mem9 via the import API.
 
-Reads daily markdown files from the corpus directory and sends each as a
-message-based ingest request (mode: "smart") to the mem9 API, matching the
-shape used by the openclaw-plugin smart pipeline.
+Reads daily markdown files from the corpus directory and uploads each through
+the /v1alpha1/mem9s/{tenantID}/imports endpoint as a multipart file upload.
 
 Usage:
-    python3 benchmark/scripts/smart-ingest-corpus.py \
+    python3 benchmark/daily-memory/smart-ingest-corpus.py \
         --corpus-dir benchmark/results/.../corpus \
         --base-url https://api.mem9.ai \
         --tenant-id <space-id> \
@@ -16,6 +15,7 @@ Usage:
 
 import argparse
 import glob
+import io
 import json
 import os
 import sys
@@ -24,25 +24,52 @@ import urllib.request
 import urllib.error
 
 
-def ingest_day(base_url: str, tenant_id: str, agent_id: str,
-               date: str, content: str, session_id: str) -> dict:
-    """Send one day's content through the smart-ingest pipeline."""
-    url = f"{base_url}/v1alpha1/mem9s/{tenant_id}/memories"
-    body = {
-        "messages": [
-            {"role": "user", "content": f"Here is my daily log for {date}."},
-            {"role": "assistant", "content": content},
-        ],
-        "session_id": session_id,
-        "agent_id": agent_id,
-        "mode": "smart",
-    }
-    data = json.dumps(body).encode("utf-8")
+def import_file(base_url: str, tenant_id: str, agent_id: str,
+                filepath: str, session_id: str) -> dict:
+    """Upload one corpus file through the import endpoint."""
+    url = f"{base_url}/v1alpha1/mem9s/{tenant_id}/imports"
+    filename = os.path.basename(filepath)
+
+    with open(filepath, "rb") as f:
+        file_data = f.read()
+
+    # Build multipart/form-data body
+    boundary = "----Mem9BenchmarkBoundary"
+    body = io.BytesIO()
+
+    # file field
+    body.write(f"--{boundary}\r\n".encode())
+    body.write(f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode())
+    body.write(b"Content-Type: text/markdown\r\n\r\n")
+    body.write(file_data)
+    body.write(b"\r\n")
+
+    # agent_id field
+    body.write(f"--{boundary}\r\n".encode())
+    body.write(b'Content-Disposition: form-data; name="agent_id"\r\n\r\n')
+    body.write(agent_id.encode())
+    body.write(b"\r\n")
+
+    # session_id field
+    body.write(f"--{boundary}\r\n".encode())
+    body.write(b'Content-Disposition: form-data; name="session_id"\r\n\r\n')
+    body.write(session_id.encode())
+    body.write(b"\r\n")
+
+    # file_type field
+    body.write(f"--{boundary}\r\n".encode())
+    body.write(b'Content-Disposition: form-data; name="file_type"\r\n\r\n')
+    body.write(b"memory")
+    body.write(b"\r\n")
+
+    body.write(f"--{boundary}--\r\n".encode())
+
+    data = body.getvalue()
     req = urllib.request.Request(
         url,
         data=data,
         headers={
-            "Content-Type": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
             "X-Mnemo-Agent-Id": agent_id,
         },
         method="POST",
@@ -72,50 +99,44 @@ def ingest_day(base_url: str, tenant_id: str, agent_id: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Ingest daily-memory corpus into mem9 via smart-ingest")
+        description="Ingest daily-memory corpus into mem9 via import API")
     parser.add_argument("--corpus-dir", required=True,
-                        help="Directory containing day-NNN_YYYY-MM-DD.md files")
+                        help="Directory containing YYYY-MM-DD.md corpus files")
     parser.add_argument("--base-url", required=True,
                         help="mem9 API base URL")
     parser.add_argument("--tenant-id", required=True,
                         help="mem9 space/tenant ID")
     parser.add_argument("--agent-id", default="daily-memory-bench",
-                        help="Agent ID for ingest requests")
+                        help="Agent ID for import requests")
     parser.add_argument("--session-id", default="daily-memory-e2e",
-                        help="Session ID for ingest requests")
+                        help="Session ID for import requests")
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     corpus_dir = args.corpus_dir
 
-    # Find all daily markdown files
-    pattern = os.path.join(corpus_dir, "day-*_*.md")
+    # Find all daily markdown files (YYYY-MM-DD.md)
+    pattern = os.path.join(corpus_dir, "*.md")
     files = sorted(glob.glob(pattern))
     if not files:
-        print(f"ERROR: No day files found matching {pattern}", file=sys.stderr)
+        print(f"ERROR: No corpus files found matching {pattern}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"    Ingesting {len(files)} daily files via smart-ingest")
+    print(f"    Importing {len(files)} daily files via import API")
     print(f"    Target: {base_url} / tenant={args.tenant_id}")
 
     succeeded = 0
     failed = 0
     for i, filepath in enumerate(files):
         filename = os.path.basename(filepath)
-        # Extract date from filename: day-NNN_YYYY-MM-DD.md
-        parts = filename.replace(".md", "").split("_", 1)
-        date = parts[1] if len(parts) > 1 else filename
 
-        with open(filepath) as f:
-            content = f.read()
-
-        result = ingest_day(
+        result = import_file(
             base_url, args.tenant_id, args.agent_id,
-            date, content, args.session_id,
+            filepath, args.session_id,
         )
 
         status = result.get("status", "unknown")
-        if status in ("accepted", "complete", "partial"):
+        if status in ("accepted", "pending", "complete", "partial"):
             succeeded += 1
         else:
             failed += 1
@@ -126,7 +147,7 @@ def main():
             print(f"    Progress: {i + 1}/{len(files)} "
                   f"(ok={succeeded}, fail={failed})")
 
-    print(f"    Smart-ingest complete: {succeeded} succeeded, {failed} failed")
+    print(f"    Import complete: {succeeded} succeeded, {failed} failed")
     if failed > 0:
         sys.exit(1)
 

@@ -34,7 +34,7 @@ If `MEM9_BASE_URL` is unset, the harness uses the hosted mem9 API at `https://ap
 The daily-memory E2E benchmark compares file-based workspace recall (Profile A) against mem9 smart-ingest recall (Profile B) using the synthetic daily-memory corpus and OpenClaw agent calls.
 
 ```bash
-bash benchmark/scripts/daily-memory-e2e.sh
+bash benchmark/daily-memory/daily-memory-e2e.sh
 ```
 
 ### Required environment variables
@@ -61,14 +61,14 @@ Profile A gets the daily markdown files in its workspace. Profile B gets the sam
 ## Layout
 
 - `scripts/benchmark.sh` — top-level A/B benchmark runner
-- `scripts/daily-memory-e2e.sh` — daily-memory E2E benchmark (files vs mem9 smart-ingest)
 - `scripts/drive-session.py` — sends the same prompt sequence to baseline and mem9 profiles
-- `scripts/drive-daily-memory-e2e.py` — question driver + scorer for the daily-memory E2E benchmark
-- `scripts/smart-ingest-corpus.py` — ingests daily corpus into mem9 via smart-ingest API
 - `scripts/report.py` — renders the HTML comparison report
 - `MR-NIAH/` — dataset bridge for the MR-NIAH benchmark
 - `locomo/` — LoCoMo benchmark harness
 - `daily-memory/` — synthetic daily-memory retrieval benchmark (raw writes, rule-based scoring)
+- `daily-memory/daily-memory-e2e.sh` — daily-memory E2E benchmark (files vs mem9 smart-ingest)
+- `daily-memory/drive-daily-memory-e2e.py` — question driver + scorer for the daily-memory E2E benchmark
+- `daily-memory/smart-ingest-corpus.py` — ingests daily corpus into mem9 via smart-ingest API
 - `workspace/` — shared workspace context copied into temporary benchmark profiles
 - `results/` — benchmark outputs
 

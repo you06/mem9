@@ -5,12 +5,12 @@
  * shell script without needing the full CLI (which also runs ingest + eval).
  *
  * Usage:
- *   npx tsx benchmark/scripts/generate-corpus.mts \
+ *   npx tsx benchmark/daily-memory/generate-corpus.mts \
  *     --seed 42 --days 30 --topics 10 --words 200 \
  *     --start-date 2024-01-01 --out-dir ./data
  */
 
-import { generate } from "../daily-memory/src/generator.js";
+import { generate } from "./src/generator.js";
 import { parseArgs } from "node:util";
 
 const { values } = parseArgs({

@@ -110,7 +110,7 @@ See [`benchmark/daily-memory/USAGE.md`](../benchmark/daily-memory/USAGE.md) for 
 
 ## Daily-Memory E2E Benchmark
 
-The `benchmark/scripts/daily-memory-e2e.sh` harness extends the daily-memory benchmark into a full **end-to-end** comparison using live OpenClaw agent calls. It compares two memory approaches:
+The `benchmark/daily-memory/daily-memory-e2e.sh` harness extends the daily-memory benchmark into a full **end-to-end** comparison using live OpenClaw agent calls. It compares two memory approaches:
 
 - **Profile A (baseline):** Daily markdown files placed in the agent's workspace. The agent uses native file reading and search to answer questions.
 - **Profile B (treatment):** The same corpus ingested into mem9 via the **smart-ingest pipeline** (messages-based, `mode: "smart"`). The agent uses the mem9 plugin for recall.
@@ -121,7 +121,7 @@ Both profiles receive identical questions and are scored with the same 5-categor
 
 ```bash
 export CLAUDE_CODE_TOKEN=...
-bash benchmark/scripts/daily-memory-e2e.sh
+bash benchmark/daily-memory/daily-memory-e2e.sh
 ```
 
 ### Configuration

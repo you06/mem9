@@ -152,11 +152,11 @@ const TOPIC_DEFS: TopicDef[] = [
   },
   {
     name: "cooking",
-    template: "Cooked {{dish}} for {{meal}}. Key ingredient: {{ingredient}}. Cooking time was {{cookTime}} minutes. Rating: {{rating}}/10. Notes: {{notes}}.",
-    slotKeys: ["dish", "meal", "ingredient", "cookTime", "rating", "notes"],
+    template: "Cooked {{dish}} for {{occasion}}. Key ingredient: {{ingredient}}. Cooking time was {{cookTime}} minutes. Rating: {{rating}}/10. Notes: {{notes}}.",
+    slotKeys: ["dish", "occasion", "ingredient", "cookTime", "rating", "notes"],
     slotPools: {
       dish: ["pasta carbonara", "chicken tikka masala", "vegetable stir fry", "beef bourguignon", "sushi rolls", "mushroom risotto", "thai green curry", "shakshuka"],
-      meal: ["dinner", "lunch", "weekend brunch", "meal prep Sunday"],
+      occasion: ["dinner", "lunch", "weekend brunch", "meal prep Sunday"],
       ingredient: ["smoked pancetta", "garam masala blend", "fresh ginger root", "red wine reduction", "nori sheets", "arborio rice", "lemongrass stalks", "harissa paste"],
       cookTime: ["20", "35", "45", "90", "120", "60"],
       rating: ["6", "7", "8", "9", "10"],
@@ -457,6 +457,46 @@ const FILLER_SENTENCES: string[] = [
   "Charged all devices overnight.",
   "Read a few pages of a novel before sleep.",
   "The sunset was particularly vivid this evening.",
+
+  // Longer paragraph-length fillers for context-window stress testing.
+  // These must stay free of proper nouns, specific dates, numbers, project
+  // names, or technical details that could overlap with topic slot values.
+
+  "The office was quieter than usual this morning, which made it easier to concentrate on routine tasks. Sometimes the ambient hum of a busy workspace helps, but today the silence felt refreshing and allowed deeper focus without interruption.",
+
+  "The commute home felt longer than usual, probably because traffic was heavier in the late afternoon. Sat in the car listening to a podcast about general productivity habits and thinking about how to structure the rest of the evening around errands and relaxation.",
+
+  "Lunch was simple today — leftover soup from the weekend heated up in the microwave. It was satisfying enough, though not particularly exciting. Made a mental note to try that new salad place everyone keeps mentioning whenever the weather warms up a bit more.",
+
+  "Spent a few minutes tidying the desk area before settling in for the afternoon. Clearing away old papers and rearranging the monitor stand made the whole workspace feel more inviting. Small environmental changes can make a surprisingly big difference in mood.",
+
+  "Took a longer walk during the midday break than usual, looping around the block twice instead of once. The fresh air and movement helped reset focus for the second half of the day. Walking without headphones for once was a nice change of pace.",
+
+  "The vending machine in the break room was out of the usual snack options, so ended up grabbing a granola bar from the bottom shelf instead. It was actually quite good — oats and dried fruit with a hint of cinnamon. Might become the new go-to choice.",
+
+  "Rain started around mid-afternoon and the sound of it against the windows was oddly soothing. Watched the droplets trail down the glass for a minute before turning back to the screen. Rainy days have a particular rhythm that can be either calming or draining depending on mood.",
+
+  "Had a brief hallway conversation with someone from a different floor about the building temperature. Apparently the heating system has been inconsistent all week. Agreed that layering clothes is the safest strategy when the thermostat seems to have a mind of its own.",
+
+  "Noticed the houseplant on the windowsill is finally growing a new leaf after weeks of looking dormant. Gave it a bit of extra water and rotated the pot so the new growth faces the light. Small signs of progress in unexpected places can be oddly motivating.",
+
+  "The elevator was out of service for part of the morning, which meant taking the stairs. It was a minor inconvenience but doubled as a bit of exercise. By the third trip up and down, the legs were definitely feeling it. Resolved to take stairs more often regardless.",
+
+  "Tried a different tea blend this afternoon instead of the usual coffee. It had a mild floral note that was pleasant without being overpowering. Not sure it provided the same alertness boost, but it was a nice change from the standard caffeine routine.",
+
+  "Spent the last few minutes of the workday organizing browser tabs and closing out windows that had been open for days. Digital clutter accumulates just as easily as physical clutter, and periodic cleanup sessions help maintain a sense of order and reduce cognitive load.",
+
+  "The parking lot was nearly empty by the time the workday wrapped up. There is something peaceful about being one of the last to leave — the building settles into quiet and the transition from work mode to personal time feels more deliberate and intentional.",
+
+  "Glanced at the whiteboard near the entrance on the way out and noticed someone had drawn a small cartoon in the corner. It was a stick figure holding a coffee mug with steam rising from it. These little anonymous contributions always bring a small smile.",
+
+  "Dinner was a quick stir-fry thrown together from whatever vegetables were left in the fridge. The key to a good weeknight meal seems to be having a reliable sauce base and not overthinking the ingredient combination. Simplicity often wins over ambition in the kitchen.",
+
+  "Sat outside for a few minutes after dinner watching the sky shift colors as the sun went down. The transition from warm oranges to deep blues never gets old, even on unremarkable evenings. Taking a moment to notice these things feels like a worthwhile habit to maintain.",
+
+  "Before winding down for the night, laid out clothes and packed a bag for the next morning. Front-loading small decisions the evening before makes the start of the day smoother and removes friction from the morning routine when willpower is still warming up.",
+
+  "The neighborhood was unusually quiet during the evening walk. Most houses had lights on but curtains drawn, giving the whole street a calm, settled feeling. The cool air carried a faint smell of someone grilling nearby, mixing with the scent of damp pavement.",
 ]
 
 // ---------------------------------------------------------------------------
@@ -578,7 +618,7 @@ const generateEntries = (
 // Question generation
 // ---------------------------------------------------------------------------
 
-const generateQuestions = (rng: Rng, entries: DailyEntry[]): BenchmarkQuestion[] => {
+const generateQuestions = (rng: Rng, entries: DailyEntry[], questionsPerCategory: number = 25): BenchmarkQuestion[] => {
   const questions: BenchmarkQuestion[] = []
   let qid = 0
 
@@ -586,32 +626,26 @@ const generateQuestions = (rng: Rng, entries: DailyEntry[]): BenchmarkQuestion[]
     questions.push({ id: `q${qid++}`, category, question, answer, aliases, sourceDays })
   }
 
-  // Build an index: for each topicId:slotKey, which days have which values
-  const slotIndex = new Map<string, Array<{ day: number, date: string, value: string }>>()
-  for (const entry of entries) {
-    for (const [key, value] of Object.entries(entry.slots)) {
-      let arr = slotIndex.get(key)
-      if (!arr) {
-        arr = []
-        slotIndex.set(key, arr)
+  const getTopicDef = (topicId: number): TopicDef => TOPIC_DEFS[topicId % TOPIC_DEFS.length]
+
+  // Shared generator for template-based categories (exact & paraphrase)
+  type SlotTemplate = { topicName: string, questionTemplate: string, answerSlot: string }
+  const generateFromTemplates = (category: QueryCategory, templates: SlotTemplate[]): void => {
+    for (const entry of rng.shuffle([...entries])) {
+      for (const topicId of entry.topicIds) {
+        const def = getTopicDef(topicId)
+        const matched = templates.filter(t => t.topicName === def.name)
+        if (matched.length === 0) continue
+        const tmpl = rng.pick(matched)
+        const value = entry.slots[`${topicId}:${tmpl.answerSlot}`]
+        if (!value) continue
+        addQ(category, tmpl.questionTemplate.replace("{{date}}", entry.date), value, [value.toLowerCase()], [entry.dayIndex])
       }
-      arr.push({ day: entry.dayIndex, date: entry.date, value })
     }
   }
 
-  // Helper to get topic def from topicId
-  const getTopicDef = (topicId: number): TopicDef => TOPIC_DEFS[topicId % TOPIC_DEFS.length]
-
-  // We'll generate questions from sampled entries
-  const sampledEntries = rng.shuffle([...entries])
-
   // --- EXACT ATTRIBUTE questions ---
-  // "On <date>, who reported progress in the standup?" → answer is the person slot
-  const exactQuestionTemplates: Array<{
-    topicName: string
-    questionTemplate: string
-    answerSlot: string
-  }> = [
+  generateFromTemplates("exact", [
     { topicName: "standup-meeting", questionTemplate: "On {{date}}, who reported progress in the standup meeting?", answerSlot: "person" },
     { topicName: "standup-meeting", questionTemplate: "What project was discussed in the standup on {{date}}?", answerSlot: "project" },
     { topicName: "code-review", questionTemplate: "What was the PR number reviewed on {{date}}?", answerSlot: "prNumber" },
@@ -629,32 +663,10 @@ const generateQuestions = (rng: Rng, entries: DailyEntry[]): BenchmarkQuestion[]
     { topicName: "learning", questionTemplate: "What subject was studied on {{date}}?", answerSlot: "subject" },
     { topicName: "music-practice", questionTemplate: "What instrument was practiced on {{date}}?", answerSlot: "instrument" },
     { topicName: "pet-care", questionTemplate: "What is the pet's name mentioned on {{date}}?", answerSlot: "petName" },
-  ]
-
-  let exactCount = 0
-  for (const entry of sampledEntries) {
-    if (exactCount >= 40) break
-    for (const topicId of entry.topicIds) {
-      if (exactCount >= 40) break
-      const def = getTopicDef(topicId)
-      const templates = exactQuestionTemplates.filter(t => t.topicName === def.name)
-      if (templates.length === 0) continue
-      const tmpl = rng.pick(templates)
-      const slotKey = `${topicId}:${tmpl.answerSlot}`
-      const value = entry.slots[slotKey]
-      if (!value) continue
-      const question = tmpl.questionTemplate.replace("{{date}}", entry.date)
-      addQ("exact", question, value, [value.toLowerCase()], [entry.dayIndex])
-      exactCount++
-    }
-  }
+  ])
 
   // --- PARAPHRASE questions ---
-  const paraphraseTemplates: Array<{
-    topicName: string
-    questionTemplate: string
-    answerSlot: string
-  }> = [
+  generateFromTemplates("paraphrase", [
     { topicName: "standup-meeting", questionTemplate: "During the daily sync around {{date}}, which team member gave their status update?", answerSlot: "person" },
     { topicName: "code-review", questionTemplate: "Around {{date}}, which part of the codebase was changed in the pull request that was reviewed?", answerSlot: "component" },
     { topicName: "deployment", questionTemplate: "Near {{date}}, which environment received a new deployment?", answerSlot: "environment" },
@@ -666,97 +678,62 @@ const generateQuestions = (rng: Rng, entries: DailyEntry[]): BenchmarkQuestion[]
     { topicName: "meeting-notes", questionTemplate: "What architectural topic was the focus of the review meeting around {{date}}?", answerSlot: "topic" },
     { topicName: "side-project", questionTemplate: "What tech stack was used for the hobby project worked on around {{date}}?", answerSlot: "technology" },
     { topicName: "learning", questionTemplate: "What key concept was learned while studying around {{date}}?", answerSlot: "concept" },
-  ]
+  ])
 
-  let paraphraseCount = 0
-  for (const entry of rng.shuffle([...entries])) {
-    if (paraphraseCount >= 30) break
-    for (const topicId of entry.topicIds) {
-      if (paraphraseCount >= 30) break
-      const def = getTopicDef(topicId)
-      const templates = paraphraseTemplates.filter(t => t.topicName === def.name)
-      if (templates.length === 0) continue
-      const tmpl = rng.pick(templates)
-      const slotKey = `${topicId}:${tmpl.answerSlot}`
-      const value = entry.slots[slotKey]
-      if (!value) continue
-      const question = tmpl.questionTemplate.replace("{{date}}", entry.date)
-      addQ("paraphrase", question, value, [value.toLowerCase()], [entry.dayIndex])
-      paraphraseCount++
+  // --- TEMPORAL questions ---
+  const topicIdList = [...new Set(entries.flatMap(e => e.topicIds))]
+  for (const topicId of rng.shuffle([...topicIdList])) {
+    const def = getTopicDef(topicId)
+    const topicLabel = def.name.replace(/-/g, " ")
+    const daysWithTopic = entries.filter(e => e.topicIds.includes(topicId)).sort((a, b) => a.dayIndex - b.dayIndex)
+    if (daysWithTopic.length < 2) continue
+
+    const first = daysWithTopic[0]
+    addQ("temporal", `When was the first time a ${topicLabel} entry appeared in the daily log?`, first.date, [first.date, `day ${first.dayIndex + 1}`], [first.dayIndex])
+
+    const last = daysWithTopic[daysWithTopic.length - 1]
+    addQ("temporal", `When was the most recent ${topicLabel} entry in the daily log?`, last.date, [last.date, `day ${last.dayIndex + 1}`], [last.dayIndex])
+
+    // "before/after" comparison questions between pairs of days
+    if (daysWithTopic.length >= 3) {
+      const shuffledDays = rng.shuffle([...daysWithTopic])
+      for (let i = 0; i + 1 < shuffledDays.length; i += 2) {
+        const dayA = shuffledDays[i]
+        const dayB = shuffledDays[i + 1]
+        if (dayA.dayIndex === dayB.dayIndex) continue
+        const earlier = dayA.dayIndex < dayB.dayIndex ? dayA : dayB
+        const later = dayA.dayIndex < dayB.dayIndex ? dayB : dayA
+        addQ("temporal", `Which ${topicLabel} entry came first: the one on ${dayA.date} or the one on ${dayB.date}?`, `${earlier.date} came before ${later.date}`, [earlier.date], [earlier.dayIndex, later.dayIndex])
+      }
     }
   }
 
-  // --- TEMPORAL questions ---
-  // "When was the last time <topic> was mentioned?" / "What happened first, X or Y?"
-  let temporalCount = 0
-  const topicIdList = [...new Set(entries.flatMap(e => e.topicIds))]
-  for (const topicId of rng.shuffle([...topicIdList])) {
-    if (temporalCount >= 25) break
-    const def = getTopicDef(topicId)
-    const daysWithTopic = entries.filter(e => e.topicIds.includes(topicId)).sort((a, b) => a.dayIndex - b.dayIndex)
-    if (daysWithTopic.length < 2) continue
-
-    // "When was the first time <topic> appeared?"
-    const first = daysWithTopic[0]
-    addQ(
-      "temporal",
-      `When was the first time a ${def.name.replace(/-/g, " ")} entry appeared in the daily log?`,
-      first.date,
-      [first.date, `day ${first.dayIndex + 1}`],
-      [first.dayIndex],
-    )
-    temporalCount++
-
-    if (temporalCount >= 25) break
-
-    // "When was the most recent <topic>?"
-    const last = daysWithTopic[daysWithTopic.length - 1]
-    addQ(
-      "temporal",
-      `When was the most recent ${def.name.replace(/-/g, " ")} entry in the daily log?`,
-      last.date,
-      [last.date, `day ${last.dayIndex + 1}`],
-      [last.dayIndex],
-    )
-    temporalCount++
-  }
-
   // --- MULTI-HOP questions ---
-  // Require combining facts from two different days
-  let multiHopCount = 0
   for (const topicId of rng.shuffle([...topicIdList])) {
-    if (multiHopCount >= 20) break
     const def = getTopicDef(topicId)
     const daysWithTopic = entries.filter(e => e.topicIds.includes(topicId)).sort((a, b) => a.dayIndex - b.dayIndex)
     if (daysWithTopic.length < 2) continue
 
-    const day1 = rng.pick(daysWithTopic.slice(0, Math.ceil(daysWithTopic.length / 2)))
-    const day2 = rng.pick(daysWithTopic.slice(Math.ceil(daysWithTopic.length / 2)))
-    if (day1.dayIndex === day2.dayIndex) continue
+    const shuffledDays = rng.shuffle([...daysWithTopic])
+    for (let i = 0; i + 1 < shuffledDays.length; i += 2) {
+      const day1 = shuffledDays[i]
+      const day2 = shuffledDays[i + 1]
+      if (day1.dayIndex === day2.dayIndex) continue
 
-    // Pick a slot that differs between the two days
-    for (const slotKey of def.slotKeys) {
-      if (multiHopCount >= 20) break
-      const fullKey1 = `${topicId}:${slotKey}`
-      const val1 = day1.slots[fullKey1]
-      const val2 = day2.slots[fullKey1]
-      if (!val1 || !val2 || val1 === val2) continue
+      for (const slotKey of rng.shuffle([...def.slotKeys])) {
+        const fullKey = `${topicId}:${slotKey}`
+        const val1 = day1.slots[fullKey]
+        const val2 = day2.slots[fullKey]
+        if (!val1 || !val2 || val1 === val2) continue
 
-      const topicLabel = def.name.replace(/-/g, " ")
-      addQ(
-        "multi-hop",
-        `Compare the ${topicLabel} entries on ${day1.date} and ${day2.date}: what was the ${slotKey.replace(/([A-Z])/g, " $1").toLowerCase()} on each day?`,
-        `${day1.date}: ${val1}, ${day2.date}: ${val2}`,
-        [val1.toLowerCase(), val2.toLowerCase()],
-        [day1.dayIndex, day2.dayIndex],
-      )
-      multiHopCount++
-      break
+        const topicLabel = def.name.replace(/-/g, " ")
+        addQ("multi-hop", `Compare the ${topicLabel} entries on ${day1.date} and ${day2.date}: what was the ${slotKey.replace(/([A-Z])/g, " $1").toLowerCase()} on each day?`, `${day1.date}: ${val1}, ${day2.date}: ${val2}`, [val1.toLowerCase(), val2.toLowerCase()], [day1.dayIndex, day2.dayIndex])
+        break // one question per day-pair
+      }
     }
   }
 
   // --- NEGATIVE questions ---
-  // Ask about topics/facts that never appeared
   const negativeTopics = [
     "What cryptocurrency trades were logged in the daily journal?",
     "When did the daily log mention a scuba diving session?",
@@ -774,13 +751,18 @@ const generateQuestions = (rng: Rng, entries: DailyEntry[]): BenchmarkQuestion[]
     "Which astronomy observations were noted in the daily journal?",
     "When was paragliding discussed in any entry?",
   ]
-  const negativeCount = Math.min(15, negativeTopics.length)
-  const selectedNeg = rng.shuffle([...negativeTopics]).slice(0, negativeCount)
-  for (const q of selectedNeg) {
+  for (const q of rng.shuffle([...negativeTopics]).slice(0, 15)) {
     addQ("negative", q, "No information available", ["no information", "not mentioned", "no record", "none"], [])
   }
 
-  return rng.shuffle(questions)
+  // --- Balance: trim each active category to questionsPerCategory ---
+  const balanced: BenchmarkQuestion[] = []
+  for (const cat of ["exact", "paraphrase", "temporal", "multi-hop"] as const) {
+    balanced.push(...rng.shuffle(questions.filter(q => q.category === cat)).slice(0, questionsPerCategory))
+  }
+  balanced.push(...questions.filter(q => q.category === "negative"))
+
+  return rng.shuffle(balanced)
 }
 
 // ---------------------------------------------------------------------------
@@ -794,13 +776,15 @@ export interface GenerateOptions {
   wordsPerDay: number
   startDate: string
   outDir: string
+  /** Target number of questions per active category (default: 25). */
+  questionsPerCategory?: number
 }
 
 export const generate = async (opts: GenerateOptions): Promise<DatasetManifest> => {
   const rng = new Rng(opts.seed)
   const start = new Date(opts.startDate)
   const entries = generateEntries(rng, opts.numDays, opts.numTopics, opts.wordsPerDay, start)
-  const questions = generateQuestions(rng, entries)
+  const questions = generateQuestions(rng, entries, opts.questionsPerCategory)
 
   const manifest: DatasetManifest = {
     seed: opts.seed,
@@ -816,7 +800,7 @@ export const generate = async (opts: GenerateOptions): Promise<DatasetManifest> 
   const corpusDir = join(opts.outDir, "corpus")
   await mkdir(corpusDir, { recursive: true })
   for (const entry of entries) {
-    const filename = `day-${String(entry.dayIndex + 1).padStart(3, "0")}_${entry.date}.md`
+    const filename = `${entry.date}.md`
     await writeFile(join(corpusDir, filename), entry.content, "utf-8")
   }
 

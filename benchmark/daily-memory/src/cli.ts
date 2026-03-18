@@ -26,6 +26,7 @@ interface Args {
   seed: number
   skipGenerate: boolean
   skipIngest: boolean
+  skipNegative: boolean
   startDate: string
   wordsPerDay: number
 }
@@ -41,6 +42,7 @@ const parseCliArgs = (): Args => {
       "seed": { default: "42", type: "string" },
       "skip-generate": { default: false, type: "boolean" },
       "skip-ingest": { default: false, type: "boolean" },
+      "skip-negative": { default: true, type: "boolean" },
       "start-date": { default: "2024-01-01", type: "string" },
       "words-per-day": { default: "1000", type: "string" },
     },
@@ -60,6 +62,7 @@ const parseCliArgs = (): Args => {
     seed: parseInt(values.seed, 42),
     skipGenerate: values["skip-generate"],
     skipIngest: values["skip-ingest"],
+    skipNegative: values["skip-negative"],
     startDate: values["start-date"] ?? "2024-01-01",
     wordsPerDay: parseInt(values["words-per-day"], 1000),
   }
@@ -95,6 +98,7 @@ const main = async (): Promise<void> => {
   console.log(`  tenant:     ${getTenantId()}`)
   console.log(`  limit:      ${getRetrievalLimit()}`)
   console.log(`  concurrency: ${args.concurrency}`)
+  console.log(`  skipNegative: ${args.skipNegative}`)
   console.log()
 
   // ── Step 1: Generate corpus ──
@@ -121,6 +125,12 @@ const main = async (): Promise<void> => {
     const raw = await readFile(manifestPath, "utf-8")
     manifest = JSON.parse(raw) as DatasetManifest
     console.log(`Loaded manifest: ${manifest.entries.length} days, ${manifest.questions.length} questions`)
+  }
+
+  if (args.skipNegative) {
+    const before = manifest.questions.length
+    manifest.questions = manifest.questions.filter(q => q.category !== "negative")
+    console.log(`Skipped negative questions: ${before} → ${manifest.questions.length}`)
   }
 
   // ── Step 2: Ingest into mem9 ──

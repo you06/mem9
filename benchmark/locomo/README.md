@@ -29,10 +29,19 @@ Place the LoCoMo JSON file at:
 data/locomo10.json
 ```
 
+If the file is missing, the CLI will automatically download the official `locomo10.json` from the LoCoMo GitHub repository into the configured `--data-file` path.
+
 The harness also writes:
 
-- `data/conversation_ids.json` — `{ sample_id: session_id }` mapping
-- `results/*.json` — benchmark outputs
+- `results/*.json` — benchmark outputs (default output path is `results/<timestamp>.json`)
+
+You can run the benchmark with just:
+
+```bash
+npm run start
+```
+
+By default this uses `data/locomo10.json` as the dataset path and auto-downloads it if missing.
 
 ## Key design choice
 

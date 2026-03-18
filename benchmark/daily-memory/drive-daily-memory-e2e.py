@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 drive-daily-memory-e2e.py — E2E benchmark driver for the daily-memory corpus.
 
@@ -9,7 +10,7 @@ rule-based evaluation as the daily-memory retrieval benchmark.
 Each question gets a fresh session to avoid answer contamination across turns.
 
 Usage:
-    python3 benchmark/scripts/drive-daily-memory-e2e.py \
+    python3 benchmark/daily-memory/drive-daily-memory-e2e.py \
         --manifest-file <path/to/manifest.json> \
         --results-dir <output-dir> \
         --profile-a <baseline-profile> \
@@ -210,20 +211,82 @@ def parse_response(raw: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Auto-compaction helpers
+# ---------------------------------------------------------------------------
+
+FILLER_MESSAGES = [
+    "Write a detailed comparison of five different sorting algorithms, including their time complexity, space complexity, best/worst cases, and when to use each one. Include pseudocode examples.",
+    "Explain the complete history of the Internet from ARPANET to modern day, covering every major milestone, protocol development, and societal impact in detail.",
+    "Describe the architecture of a modern microservices-based e-commerce platform. Cover service decomposition, inter-service communication, database choices, caching strategies, deployment pipelines, monitoring, and failure handling in depth.",
+    "Write a comprehensive guide to memory management in operating systems, covering virtual memory, paging, segmentation, page replacement algorithms, thrashing, and how modern OSes like Linux handle each of these.",
+    "Explain the theory of relativity in detail — both special and general — covering the mathematical foundations, key experiments, implications for GPS, black holes, gravitational waves, and time dilation with worked examples.",
+    "Describe the complete lifecycle of a web request from typing a URL to rendering a page. Cover DNS resolution, TCP handshake, TLS negotiation, HTTP protocol, server-side processing, response parsing, DOM construction, CSSOM, layout, paint, and compositing.",
+    "Write a detailed tutorial on building a distributed key-value store from scratch, covering consistent hashing, replication strategies, conflict resolution, gossip protocols, failure detection, and read/write quorums.",
+    "Explain the history and evolution of database systems from hierarchical and network models through relational, object-oriented, NoSQL, and NewSQL, with detailed comparisons of their data models, query languages, and consistency guarantees.",
+    "Describe the complete process of how a modern compiler works, from lexical analysis through parsing, semantic analysis, intermediate representation, optimization passes, and code generation, with examples at each stage.",
+    "Write a comprehensive overview of cryptographic systems, covering symmetric and asymmetric encryption, hash functions, digital signatures, key exchange protocols, TLS, certificate authorities, and post-quantum cryptography approaches.",
+    "Explain the evolution of CPU architecture from simple pipelines through superscalar, out-of-order execution, branch prediction, speculative execution, SIMD, multi-core designs, and modern heterogeneous computing with detailed examples.",
+    "Describe the complete landscape of machine learning algorithms, from linear regression through decision trees, SVMs, neural networks, CNNs, RNNs, transformers, and reinforcement learning, with mathematical intuition for each.",
+    "Write a detailed guide to container orchestration with Kubernetes, covering pod lifecycle, services, deployments, stateful sets, config maps, secrets, RBAC, network policies, custom resources, and operator patterns.",
+    "Explain the mathematical foundations of information theory, covering entropy, mutual information, channel capacity, error-correcting codes, data compression algorithms, and their practical applications in modern communications.",
+    "Describe the architecture and internals of the Linux kernel, covering process scheduling, memory management, file systems, device drivers, networking stack, system calls, and kernel modules in comprehensive detail.",
+    "Write a thorough analysis of consensus algorithms in distributed systems, covering Paxos, Raft, Byzantine fault tolerance, PBFT, blockchain consensus mechanisms, and the CAP theorem with detailed examples.",
+    "Explain the complete field of computer networking, from the physical layer through data link, network, transport, and application layers, covering Ethernet, IP, TCP, UDP, HTTP, DNS, BGP, and MPLS in detail.",
+    "Describe the principles and practices of software testing at every level — unit, integration, system, acceptance, performance, security, and chaos testing — with strategies, frameworks, and real-world examples.",
+    "Write a comprehensive guide to functional programming concepts including pure functions, immutability, higher-order functions, monads, functors, type classes, algebraic data types, and category theory foundations.",
+    "Explain the complete history of programming languages from assembly through Fortran, Lisp, C, Smalltalk, ML, Haskell, Java, Python, Rust, and beyond, covering their design philosophies and lasting contributions.",
+]
+
+
+def get_compaction_count(profile: str, timeout: int,
+                         session_id: str) -> int:
+    """Send /status and parse compaction count from output."""
+    raw = send_prompt(profile, "/status", timeout, session_id)
+    text = parse_response(raw)
+    match = re.search(r"Compactions:\s*(\d+)", text)
+    return int(match.group(1)) if match else 0
+
+
+def trigger_auto_compaction(profile: str, timeout: int,
+                            session_id: str,
+                            max_rounds: int = 50) -> int:
+    """Send filler chat until auto-compaction fires. Returns rounds sent."""
+    initial_count = get_compaction_count(profile, timeout, session_id)
+
+    for i in range(max_rounds):
+        msg = FILLER_MESSAGES[i % len(FILLER_MESSAGES)]
+        send_prompt(profile, msg, timeout, session_id)
+
+        # Check every 3 rounds to avoid excessive /status calls
+        if (i + 1) % 3 == 0:
+            current = get_compaction_count(profile, timeout, session_id)
+            if current > initial_count:
+                print(f"    [{profile}] Auto-compaction detected after "
+                      f"{i + 1} filler messages")
+                return i + 1
+
+    print(f"    [{profile}] WARNING: max rounds ({max_rounds}) reached "
+          f"without compaction")
+    return max_rounds
+
+
+# ---------------------------------------------------------------------------
 # Question selection
 # ---------------------------------------------------------------------------
 
 CATEGORIES = ["exact", "paraphrase", "temporal", "multi-hop", "negative"]
 
 
-def select_questions(questions: list[dict], max_total: int) -> list[dict]:
-    """Select a balanced subset of questions across all 5 categories."""
+def select_questions(questions: list[dict], max_total: int,
+                     categories: list[str] | None = None) -> list[dict]:
+    """Select a balanced subset of questions across categories."""
+    cats = categories if categories is not None else CATEGORIES
     if max_total <= 0 or max_total >= len(questions):
         return questions
 
-    per_cat = max(1, max_total // len(CATEGORIES))
+    per_cat = max(1, max_total // len(cats))
     selected: list[dict] = []
-    for cat in CATEGORIES:
+    for cat in cats:
         cat_qs = [q for q in questions if q["category"] == cat]
         selected.extend(cat_qs[:per_cat])
 
@@ -254,9 +317,11 @@ PROMPT_TEMPLATE = (
 # Stats computation
 # ---------------------------------------------------------------------------
 
-def compute_stats(results: list[dict], profile_key: str) -> dict:
+def compute_stats(results: list[dict], profile_key: str,
+                  categories: list[str] | None = None) -> dict:
     """Compute per-category and overall stats for one profile."""
-    by_cat: dict[str, list[float]] = {c: [] for c in CATEGORIES}
+    cats = categories if categories is not None else CATEGORIES
+    by_cat: dict[str, list[float]] = {c: [] for c in cats}
     for r in results:
         cat = r["category"]
         if cat in by_cat:
@@ -267,8 +332,8 @@ def compute_stats(results: list[dict], profile_key: str) -> dict:
 
     all_scores = [r[f"score_{profile_key}"] for r in results]
     return {
-        "byCategory": {c: round(avg(by_cat[c]), 4) for c in CATEGORIES},
-        "byCategoryCount": {c: len(by_cat[c]) for c in CATEGORIES},
+        "byCategory": {c: round(avg(by_cat[c]), 4) for c in cats},
+        "byCategoryCount": {c: len(by_cat[c]) for c in cats},
         "overall": round(avg(all_scores), 4),
         "total": len(results),
     }
@@ -336,13 +401,15 @@ def write_transcript(results: list[dict], results_dir: str) -> str:
 
 
 def write_html_report(results: list[dict], stats_a: dict, stats_b: dict,
-                      results_dir: str) -> str:
+                      results_dir: str,
+                      categories: list[str] | None = None) -> str:
     """Generate a self-contained HTML report comparing A vs B scores."""
+    cats = categories if categories is not None else CATEGORIES
     timestamp = datetime.now(timezone.utc).isoformat()
 
     # Build category rows
     cat_rows = []
-    for cat in CATEGORIES:
+    for cat in cats:
         sa = stats_a["byCategory"].get(cat, 0)
         sb = stats_b["byCategory"].get(cat, 0)
         n = stats_a["byCategoryCount"].get(cat, 0)
@@ -503,6 +570,8 @@ def main():
                         help="Per-question timeout in seconds")
     parser.add_argument("--max-questions", type=int, default=0,
                         help="Max questions (0=all, balanced across categories)")
+    parser.add_argument("--skip-negative", default="true",
+                        help="Skip negative-category questions (default: true)")
     args = parser.parse_args()
 
     # Load questions from manifest
@@ -510,17 +579,38 @@ def main():
         manifest = json.load(f)
     all_questions = manifest.get("questions", [])
 
-    questions = select_questions(all_questions, args.max_questions)
+    skip_neg = args.skip_negative.lower() in ("true", "1", "yes")
+    if skip_neg:
+        all_questions = [q for q in all_questions if q["category"] != "negative"]
+        active_categories = [c for c in CATEGORIES if c != "negative"]
+    else:
+        active_categories = list(CATEGORIES)
+
+    questions = select_questions(all_questions, args.max_questions,
+                                active_categories)
 
     print(f"    Daily-Memory E2E Benchmark")
     print(f"    Questions: {len(questions)} / {len(all_questions)} total")
     print(f"    Profile A: {args.profile_a} (file-based)")
     print(f"    Profile B: {args.profile_b} (mem9)")
     print(f"    Timeout:   {args.timeout}s per question")
+    if skip_neg:
+        print(f"    Negative:  skipped")
     print()
 
     os.makedirs(args.results_dir, exist_ok=True)
     results: list[dict] = []
+
+    # Trigger auto-compaction by filling context with unrelated chat
+    # print("    Triggering auto-compaction via filler chat...")
+    # with ThreadPoolExecutor(max_workers=2) as executor:
+    #     fut_a = executor.submit(trigger_auto_compaction, args.profile_a,
+    #                             args.timeout, "dm-e2e-compact-a")
+    #     fut_b = executor.submit(trigger_auto_compaction, args.profile_b,
+    #                             args.timeout, "dm-e2e-compact-b")
+    #     rounds_a = fut_a.result()
+    #     rounds_b = fut_b.result()
+    # print(f"    Compaction done: A={rounds_a} rounds, B={rounds_b} rounds")
 
     for i, q in enumerate(questions):
         qid = q["id"]
@@ -574,8 +664,8 @@ def main():
               f"B: {sc_b:.2f} ({raw_b['elapsed_seconds']}s)")
 
     # Compute stats
-    stats_a = compute_stats(results, "a")
-    stats_b = compute_stats(results, "b")
+    stats_a = compute_stats(results, "a", active_categories)
+    stats_b = compute_stats(results, "b", active_categories)
 
     # Print summary
     print()
@@ -583,7 +673,7 @@ def main():
     print(f"  Overall   A: {stats_a['overall'] * 100:.1f}%   "
           f"B: {stats_b['overall'] * 100:.1f}%   "
           f"delta: {(stats_b['overall'] - stats_a['overall']) * 100:+.1f}%")
-    for cat in CATEGORIES:
+    for cat in active_categories:
         sa = stats_a["byCategory"].get(cat, 0)
         sb = stats_b["byCategory"].get(cat, 0)
         n = stats_a["byCategoryCount"].get(cat, 0)
@@ -607,7 +697,8 @@ def main():
     json_path = write_results_json(results, meta, stats_a, stats_b,
                                    args.results_dir)
     transcript_path = write_transcript(results, args.results_dir)
-    html_path = write_html_report(results, stats_a, stats_b, args.results_dir)
+    html_path = write_html_report(results, stats_a, stats_b, args.results_dir,
+                                  active_categories)
 
     print()
     print(f"    JSON:       {json_path}")

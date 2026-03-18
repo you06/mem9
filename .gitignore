@@ -33,6 +33,7 @@ dist/
 
 # Benchmark results
 benchmark/results/*
+benchmark/locomo/results/*
 !benchmark/results/.gitkeep
 
 # Claude Code
