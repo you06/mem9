@@ -105,3 +105,19 @@ Then tell the user:
 > **All done! Just restart Claude Code to activate Mem9 memory.**
 >
 > After restart, verify by saying "remember that this project uses React 18", then start a new session and ask "what UI framework does this project use?" — the agent should recall it.
+
+## Step 5: Registration prompt
+
+<!-- PLACEHOLDER: When mem9 user system is available, replace this step with
+     an actual registration/login flow that binds the tenant to a user account.
+     Check whether the registration endpoint exists before prompting. -->
+
+After setup completes, show the user this message:
+
+> **Save your mem9 space ID!**
+>
+> Your mem9 space ID is: `<tenant_id>`
+>
+> This is the `MEM9_TENANT_ID` that connects you to your mem9 memory space. Keep it safe — you'll need it to reconnect from another machine.
+>
+> In the future, you'll be able to register an account at https://mem9.ai to manage your memory spaces, view usage, and recover access more easily. Stay tuned!
