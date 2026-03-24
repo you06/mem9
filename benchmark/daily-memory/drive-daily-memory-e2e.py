@@ -612,6 +612,14 @@ def main():
     #     rounds_b = fut_b.result()
     # print(f"    Compaction done: A={rounds_a} rounds, B={rounds_b} rounds")
 
+    # Trigger auto-compaction by filling context with unrelated chat
+    # print("    Triggering auto-compaction via filler chat...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+            fut_a = executor.submit(
+                send_prompt, args.profile_a, "/reset", args.timeout, "dm-e2e-reset-a")
+            fut_b = executor.submit(
+                send_prompt, args.profile_b, "/reset", args.timeout, "dm-e2e-reset-b")
+
     for i, q in enumerate(questions):
         qid = q["id"]
         category = q["category"]

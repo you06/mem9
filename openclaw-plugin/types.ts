@@ -1,9 +1,8 @@
 export interface PluginConfig {
   // Server mode (apiUrl present → server)
   apiUrl?: string;
+  apiKey?: string;
   tenantID?: string;
-  apiToken?: string;
-  userToken?: string;
 
   tenantName?: string;
 
@@ -32,6 +31,8 @@ export interface Memory {
   state?: string;
   agent_id?: string;
   session_id?: string;
+
+  relative_age?: string;
 }
 
 export interface SearchResult {
