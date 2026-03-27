@@ -238,8 +238,85 @@ func (s *MemoryService) ftsOnlySearch(ctx context.Context, filter domain.MemoryF
 	}
 	slog.Info("fts search completed", "query_len", len(filter.Query), "results", len(ftsResults))
 
+	rerankByTokenOverlap(ftsResults, filter.Query)
+
 	page, total := s.paginate(ftsResults, offset, limit)
 	return populateRelativeAge(page), total, nil
+}
+
+// rerankByTokenOverlap applies a lightweight multiplicative bonus to each
+// result based on how many content-bearing query tokens appear in the memory
+// text. This promotes memories that cover more of the query's key terms,
+// complementing BM25 which can under-weight entity names and dates when
+// document frequency is high.
+func rerankByTokenOverlap(results []domain.Memory, rawQuery string) {
+	qTokens := contentTokens(rawQuery)
+	if len(qTokens) == 0 {
+		return
+	}
+
+	for i := range results {
+		if results[i].Score == nil {
+			continue
+		}
+		memSet := contentTokenSet(results[i].Content)
+
+		matches := 0
+		for _, qt := range qTokens {
+			if _, ok := memSet[qt]; ok {
+				matches++
+			}
+		}
+
+		coverage := float64(matches) / float64(len(qTokens))
+		bonus := 1.0 + coverage*0.3
+		newScore := *results[i].Score * bonus
+		results[i].Score = &newScore
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		si, sj := 0.0, 0.0
+		if results[i].Score != nil {
+			si = *results[i].Score
+		}
+		if results[j].Score != nil {
+			sj = *results[j].Score
+		}
+		return si > sj
+	})
+}
+
+// contentTokens returns de-duped, lowercased, non-stopword tokens from text.
+func contentTokens(text string) []string {
+	seen := make(map[string]struct{})
+	var tokens []string
+	for _, word := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if _, stop := ftsStopWords[word]; stop {
+			continue
+		}
+		if _, dup := seen[word]; dup {
+			continue
+		}
+		seen[word] = struct{}{}
+		tokens = append(tokens, word)
+	}
+	return tokens
+}
+
+// contentTokenSet returns a set of lowercased, non-stopword tokens from text.
+func contentTokenSet(text string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, word := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if _, stop := ftsStopWords[word]; stop {
+			continue
+		}
+		set[word] = struct{}{}
+	}
+	return set
 }
 
 // is not yet available (e.g., during cold start probe window).
