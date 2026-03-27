@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/qiffang/mnemos/server/internal/domain"
@@ -183,6 +185,41 @@ func paginateResults(results []domain.Memory, offset, limit int) ([]domain.Memor
 	return results[offset:end], total
 }
 
+// ftsStopWords contains a small set of function words that add noise to BM25
+// without carrying content signal. Intentionally conservative — words like
+// "who", "where", "when" are kept because they may carry semantic value.
+var ftsStopWords = map[string]struct{}{
+	"the": {}, "a": {}, "an": {}, "of": {}, "is": {}, "are": {},
+	"do": {}, "does": {}, "did": {}, "was": {}, "were": {},
+	"in": {}, "on": {}, "at": {}, "to": {}, "for": {}, "and": {},
+	"or": {}, "it": {}, "its": {}, "be": {}, "been": {}, "being": {},
+	"has": {}, "have": {}, "had": {}, "that": {}, "this": {},
+}
+
+// normalizeQueryForFTS cleans a natural-language query for better BM25 matching:
+// lowercase, strip punctuation, remove possessive 's, drop function words.
+// Falls back to the original query if the result is empty.
+func normalizeQueryForFTS(raw string) string {
+	raw = strings.ToLower(raw)
+	// Strip possessive: "sarah's" → "sarah"
+	raw = strings.ReplaceAll(raw, "'s", "")
+	raw = strings.ReplaceAll(raw, "\u2019s", "") // curly apostrophe
+
+	var tokens []string
+	for _, word := range strings.FieldsFunc(raw, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if _, stop := ftsStopWords[word]; stop {
+			continue
+		}
+		tokens = append(tokens, word)
+	}
+	if len(tokens) == 0 {
+		return raw // fallback to original
+	}
+	return strings.Join(tokens, " ")
+}
+
 func (s *MemoryService) ftsOnlySearch(ctx context.Context, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > 200 {
@@ -194,7 +231,8 @@ func (s *MemoryService) ftsOnlySearch(ctx context.Context, filter domain.MemoryF
 	}
 	fetchLimit := limit * 3
 
-	ftsResults, err := s.memories.FTSSearch(ctx, filter.Query, filter, fetchLimit)
+	query := normalizeQueryForFTS(filter.Query)
+	ftsResults, err := s.memories.FTSSearch(ctx, query, filter, fetchLimit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("FTS search: %w", err)
 	}
