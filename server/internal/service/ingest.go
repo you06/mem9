@@ -434,10 +434,10 @@ atomic facts from a conversation.
    - Good: "Uses Go 1.22 for backend services"
    - Bad: "Knows some programming languages"
 4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
-5. Only omit clearly throwaway utterances: greetings, filler words, and transient debugging steps
-   (e.g., "let me check", temporary file paths, one-off error messages).
-   Keep anything that describes a personal event, plan, appointment, preference change,
-   or relationship update — even if it came up during a task.
+5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
+6. Keep any stable personal information, preferences, experiences, relationships, or long-term plans
+   even if they arose in a task-specific context. Only omit purely transient details
+   (e.g., one-off debugging steps, temporary file paths).
 7. Always include temporal context when mentioned. Preserve dates, times, and temporal markers
    in the extracted fact.
    - Good: "Visited Tokyo in March 2024"
@@ -516,10 +516,10 @@ atomic facts from a conversation AND assign short descriptive tags to each messa
    - Good: "Uses Go 1.22 for backend services"
    - Bad: "Knows some programming languages"
 4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
-5. Only omit clearly throwaway utterances: greetings, filler words, and transient debugging steps
-   (e.g., "let me check", temporary file paths, one-off error messages).
-   Keep anything that describes a personal event, plan, appointment, preference change,
-   or relationship update — even if it came up during a task.
+5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
+6. Keep any stable personal information, preferences, experiences, relationships, or long-term plans
+   even if they arose in a task-specific context. Only omit purely transient details
+   (e.g., one-off debugging steps, temporary file paths).
 7. Always include temporal context when mentioned. Preserve dates, times, and temporal markers
    in the extracted fact.
    - Good: "Visited Tokyo in March 2024"
