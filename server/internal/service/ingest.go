@@ -430,14 +430,17 @@ atomic facts from a conversation.
 
 1. Extract facts ONLY from the user's messages. Ignore assistant and system messages entirely.
 2. Each fact must be a single, self-contained statement (one idea per fact).
-3. Prefer specific details over vague summaries.
-   - Good: "Uses Go 1.22 for backend services"
-   - Bad: "Knows some programming languages"
+3. Prefer specific details over vague summaries. Keep searchable nouns
+   (names, places, projects, roles) instead of abstracting them away.
+   - Good: "Joanna finished her screenplay on 23 January"
+   - Bad: "She finished a project"
 4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
-5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
-6. Keep any stable personal information, preferences, experiences, relationships, or long-term plans
-   even if they arose in a task-specific context. Only omit purely transient details
-   (e.g., one-off debugging steps, temporary file paths).
+5. When the referent is clear from context, replace pronouns with the actual
+   entity name so each fact is self-contained and searchable.
+   - Good: "Melanie considers family important"
+   - Bad: "She considers family important"
+6. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
+   Keep stable personal information, preferences, experiences, relationships, or plans.
 7. Always include temporal context when mentioned. Preserve dates, times, and temporal markers
    in the extracted fact.
    - Good: "Visited Tokyo in March 2024"
@@ -512,14 +515,17 @@ atomic facts from a conversation AND assign short descriptive tags to each messa
 
 1. Extract facts ONLY from the user's messages. Ignore assistant and system messages entirely.
 2. Each fact must be a single, self-contained statement (one idea per fact).
-3. Prefer specific details over vague summaries.
-   - Good: "Uses Go 1.22 for backend services"
-   - Bad: "Knows some programming languages"
+3. Prefer specific details over vague summaries. Keep searchable nouns
+   (names, places, projects, roles) instead of abstracting them away.
+   - Good: "Joanna finished her screenplay on 23 January"
+   - Bad: "She finished a project"
 4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
-5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
-6. Keep any stable personal information, preferences, experiences, relationships, or long-term plans
-   even if they arose in a task-specific context. Only omit purely transient details
-   (e.g., one-off debugging steps, temporary file paths).
+5. When the referent is clear from context, replace pronouns with the actual
+   entity name so each fact is self-contained and searchable.
+   - Good: "Melanie considers family important"
+   - Bad: "She considers family important"
+6. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
+   Keep stable personal information, preferences, experiences, relationships, or plans.
 7. Always include temporal context when mentioned. Preserve dates, times, and temporal markers
    in the extracted fact.
    - Good: "Visited Tokyo in March 2024"
