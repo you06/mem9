@@ -231,8 +231,32 @@ func (s *MemoryService) ftsOnlySearch(ctx context.Context, filter domain.MemoryF
 	}
 	fetchLimit := limit * 3
 
-	query := normalizeQueryForFTS(filter.Query)
-	ftsResults, err := s.memories.FTSSearch(ctx, query, filter, fetchLimit)
+	rawQuery := filter.Query
+	normQuery := normalizeQueryForFTS(rawQuery)
+
+	// If normalized query differs from raw, run dual-path FTS and merge via RRF.
+	if normQuery != rawQuery {
+		rawResults, rawErr := s.memories.FTSSearch(ctx, rawQuery, filter, fetchLimit)
+		if rawErr != nil {
+			return nil, 0, fmt.Errorf("FTS search (raw): %w", rawErr)
+		}
+		normResults, normErr := s.memories.FTSSearch(ctx, normQuery, filter, fetchLimit)
+		if normErr != nil {
+			return nil, 0, fmt.Errorf("FTS search (norm): %w", normErr)
+		}
+
+		slog.Info("dual fts search completed", "query_len", len(rawQuery), "raw_results", len(rawResults), "norm_results", len(normResults))
+
+		scores := rrfMerge(rawResults, normResults)
+		mems := collectMems(rawResults, normResults)
+		merged := sortByScore(mems, scores)
+
+		page, total := s.paginate(merged, offset, limit)
+		return populateRelativeAge(setScores(page, scores)), total, nil
+	}
+
+	// Single-path: raw and normalized are identical, no need for dual search.
+	ftsResults, err := s.memories.FTSSearch(ctx, normQuery, filter, fetchLimit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("FTS search: %w", err)
 	}
