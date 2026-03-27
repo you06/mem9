@@ -200,7 +200,10 @@ var ftsStopWords = map[string]struct{}{
 // lowercase, strip punctuation, remove possessive 's, drop function words.
 // Falls back to the original query if the result is empty.
 func normalizeQueryForFTS(raw string) string {
-	raw = stripPossessive(strings.ToLower(raw))
+	raw = strings.ToLower(raw)
+	// Strip possessive: "sarah's" → "sarah"
+	raw = strings.ReplaceAll(raw, "'s", "")
+	raw = strings.ReplaceAll(raw, "\u2019s", "") // curly apostrophe
 
 	var tokens []string
 	for _, word := range strings.FieldsFunc(raw, func(r rune) bool {
@@ -283,20 +286,11 @@ func rerankByTokenOverlap(results []domain.Memory, rawQuery string) {
 	})
 }
 
-// stripPossessive removes English possessive suffixes so that tokenization
-// stays consistent with normalizeQueryForFTS.
-func stripPossessive(s string) string {
-	s = strings.ReplaceAll(s, "'s", "")
-	s = strings.ReplaceAll(s, "\u2019s", "")
-	return s
-}
-
 // contentTokens returns de-duped, lowercased, non-stopword tokens from text.
 func contentTokens(text string) []string {
-	normalized := stripPossessive(strings.ToLower(text))
 	seen := make(map[string]struct{})
 	var tokens []string
-	for _, word := range strings.FieldsFunc(normalized, func(r rune) bool {
+	for _, word := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
 		if _, stop := ftsStopWords[word]; stop {
@@ -313,9 +307,8 @@ func contentTokens(text string) []string {
 
 // contentTokenSet returns a set of lowercased, non-stopword tokens from text.
 func contentTokenSet(text string) map[string]struct{} {
-	normalized := stripPossessive(strings.ToLower(text))
 	set := make(map[string]struct{})
-	for _, word := range strings.FieldsFunc(normalized, func(r rune) bool {
+	for _, word := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
 		if _, stop := ftsStopWords[word]; stop {
