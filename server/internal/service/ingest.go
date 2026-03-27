@@ -435,10 +435,22 @@ atomic facts from a conversation.
    - Bad: "Knows some programming languages"
 4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
 5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
-6. Omit information that is only relevant to the current task and has no future reuse value.
-7. If no meaningful facts exist in the conversation, return an empty facts array.
-8. Assign 1-3 short lowercase tags to each extracted fact describing its topic or
-   category. Examples: "tech", "personal", "preference", "work", "location", "habit".
+6. Keep any stable personal information, preferences, experiences, relationships, or long-term plans
+   even if they arose in a task-specific context. Only omit purely transient details
+   (e.g., one-off debugging steps, temporary file paths).
+7. Always include temporal context when mentioned. Preserve dates, times, and temporal markers
+   in the extracted fact.
+   - Good: "Visited Tokyo in March 2024"
+   - Bad: "Visited Tokyo"
+   - Good: "Started learning piano last summer"
+   - Bad: "Is learning piano"
+8. Extract relationships between people explicitly.
+   - Good: "Sarah is the user's sister"
+   - Good: "Works with John on the ML team"
+9. If no meaningful facts exist in the conversation, return an empty facts array.
+10. Assign 1-3 short lowercase tags to each extracted fact describing its topic or
+   category. Examples: "tech", "personal", "preference", "work", "location", "habit",
+   "relationship", "event", "timeline".
    Use hyphens for multi-word tags: "programming-language", "work-tool".
    If no meaningful tags apply, omit the "tags" field for that fact.
 
@@ -505,10 +517,22 @@ atomic facts from a conversation AND assign short descriptive tags to each messa
    - Bad: "Knows some programming languages"
 4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
 5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
-6. Omit information that is only relevant to the current task and has no future reuse value.
-7. If no meaningful facts exist in the conversation, return an empty facts array.
-8. Assign 1-3 short lowercase tags to each extracted fact describing its topic or
-   category. Examples: "tech", "personal", "preference", "work", "location", "habit".
+6. Keep any stable personal information, preferences, experiences, relationships, or long-term plans
+   even if they arose in a task-specific context. Only omit purely transient details
+   (e.g., one-off debugging steps, temporary file paths).
+7. Always include temporal context when mentioned. Preserve dates, times, and temporal markers
+   in the extracted fact.
+   - Good: "Visited Tokyo in March 2024"
+   - Bad: "Visited Tokyo"
+   - Good: "Started learning piano last summer"
+   - Bad: "Is learning piano"
+8. Extract relationships between people explicitly.
+   - Good: "Sarah is the user's sister"
+   - Good: "Works with John on the ML team"
+9. If no meaningful facts exist in the conversation, return an empty facts array.
+10. Assign 1-3 short lowercase tags to each extracted fact describing its topic or
+   category. Examples: "tech", "personal", "preference", "work", "location", "habit",
+   "relationship", "event", "timeline".
    Use hyphens for multi-word tags. If no meaningful tags apply, omit the "tags" field.
 
 ## Rules — message_tags
@@ -870,7 +894,7 @@ Analyze the new facts and determine whether each should be added, updated, or de
 // returned to prevent silent duplicate writes via addAllFacts.
 func (s *IngestService) gatherExistingMemories(ctx context.Context, agentID string, facts []string) ([]domain.Memory, error) {
 	const perFactLimit = 5
-	const contentMaxLen = 150
+	const contentMaxLen = 300
 	const maxExistingMemories = 60
 	const minSimilarityScore = 0.3 // Skip vector results with score below this threshold
 
