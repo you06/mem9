@@ -893,7 +893,7 @@ Analyze the new facts and determine whether each should be added, updated, or de
 // However, if every single search attempt fails (total outage), an error is
 // returned to prevent silent duplicate writes via addAllFacts.
 func (s *IngestService) gatherExistingMemories(ctx context.Context, agentID string, facts []string) ([]domain.Memory, error) {
-	const perFactLimit = 5
+	const perFactLimit = 10
 	const contentMaxLen = 300
 	const maxExistingMemories = 60
 	const minSimilarityScore = 0.3 // Skip vector results with score below this threshold
