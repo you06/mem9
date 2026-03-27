@@ -684,9 +684,9 @@ func (s *IngestService) reconcile(ctx context.Context, agentName, agentID, sessi
 
 ## Actions
 
-- **ADD**: The fact is new information not present in any existing memory.
-- **UPDATE**: The fact refines, corrects, or adds detail to an existing memory. Keep the same ID. If the existing memory and the new fact convey the same meaning, keep the one with more information. Do NOT update if they mean the same thing (e.g., "Likes pizza" vs "Loves pizza").
-- **DELETE**: The fact directly contradicts an existing memory, making it obsolete.
+- **ADD**: The fact is new information not present in any existing memory. Also use ADD when the fact describes a different attribute of the same entity (e.g., existing: "Sarah is my sister", new: "Sarah lives in Osaka" → ADD both).
+- **UPDATE**: The fact replaces the same attribute/slot of the same entity. Only use when the old and new values are about the exact same property (e.g., location→location, preference→preference). Do NOT update if they mean the same thing (e.g., "Likes pizza" vs "Loves pizza").
+- **DELETE**: The fact explicitly contradicts an existing memory, making it factually wrong. Do NOT delete just because a memory is less specific or incomplete.
 - **NOOP**: The fact is already captured by an existing memory. No action needed.
 
 ## Rules
@@ -694,7 +694,7 @@ func (s *IngestService) reconcile(ctx context.Context, agentName, agentID, sessi
 1. Reference existing memories by their integer ID ONLY (0, 1, 2...). Never invent IDs.
 2. For UPDATE, always include the original text in "old_memory".
 3. For ADD, the "id" field is ignored by the system — set it to "new" or omit it.
-4. When the fact adds detail or corrects an existing memory on the same topic, prefer UPDATE.
+4. UPDATE only when the new fact targets the same entity AND the same attribute slot as an existing memory. If the fact adds a new attribute (e.g., a relationship, event, or location) about an already-known entity, use ADD instead.
 5. When the fact covers a topic not in any existing memory, use ADD.
 6. When the fact means the same thing as an existing memory (even if worded differently), use NOOP.
 7. Preserve the language of the original facts. Do not translate.
@@ -715,10 +715,10 @@ Example 1 — ADD new information:
   New facts: ["Name is John"]
   Result: {"memory": [{"id": "0", "text": "Is a software engineer", "event": "NOOP"}, {"id": "new", "text": "Name is John", "event": "ADD", "tags": ["personal"]}]}
 
-Example 2 — UPDATE with more detail:
-  Existing memories: [{"id": 0, "text": "Likes to play cricket", "age": "3 weeks ago"}, {"id": 1, "text": "Is a software engineer", "age": "2 months ago"}]
-  New facts: ["Loves to play cricket with friends on weekends"]
-  Result: {"memory": [{"id": "0", "text": "Loves to play cricket with friends on weekends", "event": "UPDATE", "old_memory": "Likes to play cricket", "tags": ["personal", "habit"]}, {"id": "1", "text": "Is a software engineer", "event": "NOOP"}]}
+Example 2 — ADD new attribute about known entity (do NOT update):
+  Existing memories: [{"id": 0, "text": "Sarah is my sister", "age": "3 weeks ago"}, {"id": 1, "text": "Is a software engineer", "age": "2 months ago"}]
+  New facts: ["Sarah lives in Osaka"]
+  Result: {"memory": [{"id": "0", "text": "Sarah is my sister", "event": "NOOP"}, {"id": "1", "text": "Is a software engineer", "event": "NOOP"}, {"id": "new", "text": "Sarah lives in Osaka", "event": "ADD", "tags": ["relationship", "location"]}]}
 
 Example 3 — DELETE contradicted information:
   Existing memories: [{"id": 0, "text": "Name is John", "age": "5 months ago"}, {"id": 1, "text": "Loves cheese pizza", "age": "3 months ago"}]
