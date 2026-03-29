@@ -289,6 +289,13 @@ func (s *IngestService) ReconcileContent(ctx context.Context, agentName, agentID
 		}, nil
 	}
 
+	// Async graph indexing for content-mode path (same as ReconcilePhase2).
+	if s.graph != nil && len(insightIDs) > 0 {
+		ids := make([]string, len(insightIDs))
+		copy(ids, insightIDs)
+		go s.indexMemoriesGraph(context.Background(), ids, agentID, sessionID)
+	}
+
 	status := "complete"
 	if failures > 0 && len(insightIDs) == 0 {
 		status = "failed"
