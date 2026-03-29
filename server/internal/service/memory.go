@@ -222,7 +222,7 @@ func (s *MemoryService) expandViaGraph(ctx context.Context, seedIDs []string, ag
 // logGraphDiagnostic runs graph expansion in diagnostic mode: logs what the graph
 // leg would contribute without actually merging into search results.
 // This helps evaluate graph recall quality before re-enabling the read leg.
-func (s *MemoryService) logGraphDiagnostic(ctx context.Context, seedIDs []string, agentID string, limit int, existingMems map[string]domain.Memory) {
+func (s *MemoryService) logGraphDiagnostic(ctx context.Context, query string, seedIDs []string, agentID string, limit int, existingMems map[string]domain.Memory) {
 	if s.graph == nil || len(seedIDs) == 0 {
 		return
 	}
@@ -231,22 +231,52 @@ func (s *MemoryService) logGraphDiagnostic(ctx context.Context, seedIDs []string
 		slog.Debug("graph diagnostic: expansion failed", "err", err)
 		return
 	}
+	if len(hits) == 0 {
+		return
+	}
 
-	newCount := 0
-	overlapCount := 0
+	// Dedup by memory_id.
+	newIDs := make(map[string]struct{})
+	overlapIDs := make(map[string]struct{})
 	for _, h := range hits {
 		if _, exists := existingMems[h.MemoryID]; exists {
-			overlapCount++
+			overlapIDs[h.MemoryID] = struct{}{}
 		} else {
-			newCount++
+			newIDs[h.MemoryID] = struct{}{}
 		}
 	}
 
+	// Collect new memory IDs (truncate to top 10 for log readability).
+	const maxLogIDs = 10
+	newIDList := make([]string, 0, len(newIDs))
+	for id := range newIDs {
+		newIDList = append(newIDList, id)
+	}
+	logNewIDs := newIDList
+	if len(logNewIDs) > maxLogIDs {
+		logNewIDs = logNewIDs[:maxLogIDs]
+	}
+
+	// Truncate seed IDs for log readability.
+	logSeedIDs := seedIDs
+	if len(logSeedIDs) > maxLogIDs {
+		logSeedIDs = logSeedIDs[:maxLogIDs]
+	}
+
+	// Truncate query for log readability.
+	logQuery := query
+	if len(logQuery) > 200 {
+		logQuery = logQuery[:200]
+	}
+
 	slog.Info("graph diagnostic",
+		"query", logQuery,
+		"seed_ids", logSeedIDs,
 		"seed_count", len(seedIDs),
 		"total_hits", len(hits),
-		"new_memories", newCount,
-		"overlap_with_hybrid", overlapCount,
+		"unique_new_memories", len(newIDs),
+		"unique_overlap_memories", len(overlapIDs),
+		"new_memory_ids", logNewIDs,
 	)
 }
 
@@ -402,7 +432,7 @@ func (s *MemoryService) hybridSearch(ctx context.Context, filter domain.MemoryFi
 
 	// Graph expansion diagnostic: log what graph would contribute without merging.
 	seedIDs := topKIDs(mems, scores, limit)
-	s.logGraphDiagnostic(ctx, seedIDs, filter.AgentID, fetchLimit, mems)
+	s.logGraphDiagnostic(ctx, filter.Query, seedIDs, filter.AgentID, fetchLimit, mems)
 
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
@@ -463,7 +493,7 @@ func (s *MemoryService) autoHybridSearch(ctx context.Context, filter domain.Memo
 
 	// Graph expansion diagnostic: log what graph would contribute without merging.
 	seedIDs := topKIDs(mems, scores, limit)
-	s.logGraphDiagnostic(ctx, seedIDs, filter.AgentID, fetchLimit, mems)
+	s.logGraphDiagnostic(ctx, filter.Query, seedIDs, filter.AgentID, fetchLimit, mems)
 
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
