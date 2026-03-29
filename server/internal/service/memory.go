@@ -24,7 +24,6 @@ const (
 	maxTags         = 20
 	maxBulkSize     = 100
 	defaultMinScore = 0.3
-	maxGraphExpand  = 10 // cap graph expansion to avoid flooding results with noise
 )
 
 type MemoryService struct {
