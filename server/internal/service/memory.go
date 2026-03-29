@@ -370,19 +370,15 @@ func (s *MemoryService) hybridSearch(ctx context.Context, filter domain.MemoryFi
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
 
-	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
-	// Cap graph limit to min(limit, maxGraphExpand) to avoid flooding results with noise.
+	// Graph expansion: boost-only mode. Run 1-hop expansion from top-K seeds,
+	// but only boost scores of memories already in hybrid results — do not
+	// introduce new candidates, to avoid diluting query-relevant results.
 	seedIDs := topKIDs(mems, scores, limit)
-	graphLimit := limit
-	if graphLimit > maxGraphExpand {
-		graphLimit = maxGraphExpand
-	}
-	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, graphLimit)
-	for _, m := range graphMems {
-		if _, exists := mems[m.ID]; !exists {
-			mems[m.ID] = m
+	_, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, fetchLimit)
+	for id, gs := range graphScores {
+		if _, exists := mems[id]; exists {
+			scores[id] += gs
 		}
-		scores[m.ID] += graphScores[m.ID]
 	}
 
 	applyTypeWeights(mems, scores)
@@ -442,18 +438,13 @@ func (s *MemoryService) autoHybridSearch(ctx context.Context, filter domain.Memo
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
 
-	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
+	// Graph expansion: boost-only mode (same as hybridSearch above).
 	seedIDs := topKIDs(mems, scores, limit)
-	graphLimit := limit
-	if graphLimit > maxGraphExpand {
-		graphLimit = maxGraphExpand
-	}
-	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, graphLimit)
-	for _, m := range graphMems {
-		if _, exists := mems[m.ID]; !exists {
-			mems[m.ID] = m
+	_, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, fetchLimit)
+	for id, gs := range graphScores {
+		if _, exists := mems[id]; exists {
+			scores[id] += gs
 		}
-		scores[m.ID] += graphScores[m.ID]
 	}
 
 	applyTypeWeights(mems, scores)
