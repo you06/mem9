@@ -101,6 +101,41 @@ CREATE TABLE IF NOT EXISTS memories (
 -- ALTER TABLE memories DROP COLUMN tombstone;
 -- DROP INDEX idx_tombstone ON memories;
 
+-- Graph index: entity nodes extracted from memories.
+CREATE TABLE IF NOT EXISTS graph_entities (
+  id              VARCHAR(36)     PRIMARY KEY,
+  agent_id        VARCHAR(100)    NULL,
+  session_id      VARCHAR(100)    NULL,
+  canonical_name  VARCHAR(255)    NOT NULL,
+  normalized_name VARCHAR(255)    NOT NULL  COMMENT 'LOWER(TRIM(canonical_name)) with collapsed whitespace',
+  entity_type     VARCHAR(50)     NOT NULL  COMMENT 'person|place|organization|event|work|product|pet',
+  mentions        INT             NOT NULL DEFAULT 1,
+  created_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_ge_agent        (agent_id),
+  UNIQUE INDEX idx_ge_normalized (normalized_name, agent_id),
+  INDEX idx_ge_type         (entity_type)
+);
+
+-- Graph index: directed edges between entities (or entity→literal).
+-- Every edge traces back to a source memory via source_memory_id.
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id               VARCHAR(36)     PRIMARY KEY,
+  agent_id         VARCHAR(100)    NULL,
+  session_id       VARCHAR(100)    NULL,
+  src_entity_id    VARCHAR(36)     NOT NULL,
+  relation         VARCHAR(255)    NOT NULL,
+  dst_entity_id    VARCHAR(36)     NULL      COMMENT 'non-NULL when target is a named entity',
+  dst_literal      TEXT            NULL      COMMENT 'non-NULL when target is a literal value',
+  source_memory_id VARCHAR(36)     NOT NULL,
+  confidence       DOUBLE          NOT NULL DEFAULT 1.0,
+  created_at       TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_gedge_src       (src_entity_id),
+  INDEX idx_gedge_dst       (dst_entity_id),
+  INDEX idx_gedge_memory    (source_memory_id),
+  INDEX idx_gedge_agent     (agent_id)
+);
+
 -- Upload task tracking (control plane).
 CREATE TABLE IF NOT EXISTS upload_tasks (
   task_id       VARCHAR(36)   PRIMARY KEY,

@@ -76,3 +76,26 @@ type SessionRepo interface {
 	// returned per session_id. Returns ErrNotSupported on non-TiDB backends.
 	ListBySessionIDs(ctx context.Context, sessionIDs []string, limitPerSession int) ([]*domain.Session, error)
 }
+
+// GraphRepo is a derived index over memories, storing entities and relationships
+// extracted from memory content. Graph is NOT a source of truth — every edge
+// traces back to a source_memory_id in the memories table.
+//
+// The interface is memory-granular: callers pass a memory ID and its content;
+// the implementation manages internal entity/edge bookkeeping. This keeps the
+// service layer decoupled from graph internals and allows swapping TiDB CTE
+// for a dedicated graph DB (Neo4j, Neptune, etc.) by implementing this interface.
+type GraphRepo interface {
+	// UpsertFromMemory extracts entities and edges from a memory's content and
+	// stores them in the graph index. Re-calling with the same memoryID replaces
+	// all previously extracted edges for that memory.
+	UpsertFromMemory(ctx context.Context, memoryID, agentID, sessionID string, entities []domain.GraphEntity, edges []domain.GraphEdge) error
+
+	// DeleteByMemory removes all graph edges (and orphan entities) linked to a memory.
+	DeleteByMemory(ctx context.Context, memoryID string) error
+
+	// ExpandFromMemories performs 1-hop graph expansion from the given seed memory IDs.
+	// Returns additional memory IDs (via source_memory_id on edges) that are related
+	// to the seeds, along with graph hit metadata for scoring/merge.
+	ExpandFromMemories(ctx context.Context, seedMemoryIDs []string, agentID string, limit int) ([]domain.GraphHit, error)
+}

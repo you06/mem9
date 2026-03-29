@@ -56,6 +56,7 @@ type IngestService struct {
 	embedder  *embed.Embedder
 	autoModel string
 	mode      IngestMode
+	graph     *GraphService
 }
 
 // NewIngestService creates a new IngestService.
@@ -65,6 +66,7 @@ func NewIngestService(
 	embedder *embed.Embedder,
 	autoModel string,
 	defaultMode IngestMode,
+	graphSvc *GraphService,
 ) *IngestService {
 	if defaultMode == "" {
 		defaultMode = ModeSmart
@@ -75,6 +77,7 @@ func NewIngestService(
 		embedder:  embedder,
 		autoModel: autoModel,
 		mode:      defaultMode,
+		graph:     graphSvc,
 	}
 }
 
@@ -185,6 +188,15 @@ func (s *IngestService) ReconcilePhase2(ctx context.Context, agentName, agentID,
 		slog.Error("ReconcilePhase2: reconciliation failed", "err", err)
 		return &IngestResult{Status: "failed", Warnings: warnings}, nil
 	}
+
+	// Async graph indexing: extract entities+relations from newly created/updated memories.
+	// Runs in a background goroutine so graph extraction latency does not block the ingest response.
+	if s.graph != nil && len(insightIDs) > 0 {
+		ids := make([]string, len(insightIDs))
+		copy(ids, insightIDs)
+		go s.indexMemoriesGraph(context.Background(), ids, agentID, sessionID)
+	}
+
 	status := "complete"
 	if warnings > 0 && len(insightIDs) == 0 {
 		status = "partial"
@@ -195,6 +207,21 @@ func (s *IngestService) ReconcilePhase2(ctx context.Context, agentName, agentID,
 		InsightIDs:      insightIDs,
 		Warnings:        warnings,
 	}, nil
+}
+
+// indexMemoriesGraph fetches each memory by ID and runs graph entity/relation
+// extraction. Errors are logged but do not propagate — graph is best-effort.
+func (s *IngestService) indexMemoriesGraph(ctx context.Context, memoryIDs []string, agentID, sessionID string) {
+	for _, id := range memoryIDs {
+		mem, err := s.memories.GetByID(ctx, id)
+		if err != nil {
+			slog.Warn("graph index: failed to fetch memory", "memory_id", id, "err", err)
+			continue
+		}
+		if err := s.graph.IndexMemory(ctx, mem.ID, agentID, sessionID, mem.Content); err != nil {
+			slog.Warn("graph index: extraction failed", "memory_id", id, "err", err)
+		}
+	}
 }
 
 // ReconcileContent runs the full ingest pipeline (extract facts + reconcile)

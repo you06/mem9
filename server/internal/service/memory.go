@@ -31,18 +31,20 @@ type MemoryService struct {
 	embedder  *embed.Embedder
 	autoModel string
 	ingest    *IngestService
+	graph     *GraphService
 }
 
-func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, embedder *embed.Embedder, autoModel string, ingestMode IngestMode) *MemoryService {
+func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, embedder *embed.Embedder, autoModel string, ingestMode IngestMode, graphSvc *GraphService) *MemoryService {
 	return &MemoryService{
 		memories:  memories,
 		embedder:  embedder,
 		autoModel: autoModel,
-		ingest:    NewIngestService(memories, llmClient, embedder, autoModel, ingestMode),
+		ingest:    NewIngestService(memories, llmClient, embedder, autoModel, ingestMode, graphSvc),
+		graph:     graphSvc,
 	}
 }
 
-func (s *MemoryService) Create(ctx context.Context, agentID, content string, tags []string, metadata json.RawMessage) (*domain.Memory, error) {
+func (s *MemoryService) Create(ctx context.Context, agentID, sessionID, content string, tags []string, metadata json.RawMessage) (*domain.Memory, error) {
 	if err := validateMemoryInput(content, tags); err != nil {
 		return nil, err
 	}
@@ -86,7 +88,7 @@ func (s *MemoryService) Create(ctx context.Context, agentID, content string, tag
 		return mem, nil
 	}
 
-	result, err := s.ingest.ReconcileContent(ctx, agentID, agentID, "", []string{content})
+	result, err := s.ingest.ReconcileContent(ctx, agentID, agentID, sessionID, []string{content})
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +169,54 @@ func rrfMerge(ftsResults, vecResults []domain.Memory) map[string]float64 {
 		scores[m.ID] += 1.0 / (rrfK + float64(rank+1))
 	}
 	return scores
+}
+
+// expandViaGraph takes seed memory IDs from existing hybrid results, performs
+// 1-hop graph expansion, fetches the expanded memories, and returns them as
+// additional candidates with their graph-derived RRF scores.
+func (s *MemoryService) expandViaGraph(ctx context.Context, seedIDs []string, agentID string, limit int) ([]domain.Memory, map[string]float64) {
+	if s.graph == nil || len(seedIDs) == 0 {
+		return nil, nil
+	}
+	hits, err := s.graph.ExpandFromMemories(ctx, seedIDs, agentID, limit)
+	if err != nil {
+		slog.Warn("graph expansion failed, skipping", "err", err)
+		return nil, nil
+	}
+	if len(hits) == 0 {
+		return nil, nil
+	}
+
+	// Deduplicate memory IDs from graph hits and collect scores.
+	hitScores := make(map[string]float64, len(hits))
+	var expandedIDs []string
+	for _, h := range hits {
+		if _, seen := hitScores[h.MemoryID]; !seen {
+			expandedIDs = append(expandedIDs, h.MemoryID)
+		}
+		// Accumulate graph confidence as a score contribution.
+		hitScores[h.MemoryID] += h.GraphScore
+	}
+
+	// Fetch the actual memory objects for graph-expanded IDs.
+	var graphMems []domain.Memory
+	for _, id := range expandedIDs {
+		mem, err := s.memories.GetByID(ctx, id)
+		if err != nil {
+			slog.Debug("graph expand: could not fetch memory", "id", id, "err", err)
+			continue
+		}
+		graphMems = append(graphMems, *mem)
+	}
+
+	// Convert graph hits to RRF-style scores (ranked by confidence).
+	graphRRF := make(map[string]float64, len(graphMems))
+	for rank, m := range graphMems {
+		graphRRF[m.ID] = 1.0 / (rrfK + float64(rank+1))
+	}
+
+	slog.Info("graph expansion completed", "seed_count", len(seedIDs), "expanded", len(graphMems))
+	return graphMems, graphRRF
 }
 
 func (s *MemoryService) paginate(results []domain.Memory, offset, limit int) ([]domain.Memory, int) {
@@ -318,6 +368,17 @@ func (s *MemoryService) hybridSearch(ctx context.Context, filter domain.MemoryFi
 
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
+
+	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
+	seedIDs := topKIDs(mems, scores, limit)
+	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, fetchLimit)
+	for _, m := range graphMems {
+		if _, exists := mems[m.ID]; !exists {
+			mems[m.ID] = m
+		}
+		scores[m.ID] += graphScores[m.ID]
+	}
+
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
 
@@ -374,11 +435,35 @@ func (s *MemoryService) autoHybridSearch(ctx context.Context, filter domain.Memo
 
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
+
+	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
+	seedIDs := topKIDs(mems, scores, limit)
+	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, fetchLimit)
+	for _, m := range graphMems {
+		if _, exists := mems[m.ID]; !exists {
+			mems[m.ID] = m
+		}
+		scores[m.ID] += graphScores[m.ID]
+	}
+
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
 
 	page, total := s.paginate(merged, offset, limit)
 	return populateRelativeAge(setScores(page, scores)), total, nil
+}
+
+// topKIDs returns up to k memory IDs sorted by descending score.
+func topKIDs(mems map[string]domain.Memory, scores map[string]float64, k int) []string {
+	sorted := sortByScore(mems, scores)
+	if len(sorted) > k {
+		sorted = sorted[:k]
+	}
+	ids := make([]string, len(sorted))
+	for i, m := range sorted {
+		ids[i] = m.ID
+	}
+	return ids
 }
 
 func collectMems(kwResults, vecResults []domain.Memory) map[string]domain.Memory {

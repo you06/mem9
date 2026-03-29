@@ -204,6 +204,16 @@ func (s *TenantService) GetInfo(ctx context.Context, tenantID string) (*domain.T
 	}, nil
 }
 
+func (s *TenantService) EnsureGraphTables(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, tenant.TenantGraphEntitiesSchema); err != nil {
+		return fmt.Errorf("ensure graph_entities table: create: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, tenant.TenantGraphEdgesSchema); err != nil {
+		return fmt.Errorf("ensure graph_edges table: create: %w", err)
+	}
+	return nil
+}
+
 func (s *TenantService) EnsureSessionsTable(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, tenant.BuildSessionsSchema(s.autoModel, s.autoDims)); err != nil {
 		return fmt.Errorf("ensure sessions table: create: %w", err)

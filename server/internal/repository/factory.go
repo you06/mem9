@@ -74,6 +74,29 @@ func NewSessionRepo(backend string, db *sql.DB, autoModel string, ftsEnabled boo
 	}
 }
 
+// NewGraphRepo creates a GraphRepo for the specified backend.
+// Only TiDB supports graph tables; all other backends return a stub that
+// silently no-ops writes and returns nil for reads.
+func NewGraphRepo(backend string, db *sql.DB) GraphRepo {
+	switch backend {
+	case "tidb", "":
+		return tidb.NewGraphRepo(db)
+	default:
+		return stubGraphRepo{}
+	}
+}
+
+// stubGraphRepo satisfies GraphRepo for non-TiDB backends.
+type stubGraphRepo struct{}
+
+func (stubGraphRepo) UpsertFromMemory(_ context.Context, _, _, _ string, _ []domain.GraphEntity, _ []domain.GraphEdge) error {
+	return nil
+}
+func (stubGraphRepo) DeleteByMemory(_ context.Context, _ string) error { return nil }
+func (stubGraphRepo) ExpandFromMemories(_ context.Context, _ []string, _ string, _ int) ([]domain.GraphHit, error) {
+	return nil, nil
+}
+
 // stubSessionRepo satisfies SessionRepo for non-TiDB backends.
 // Write and search methods are silently skipped (consistent with the
 // IsTableNotFoundError no-op pattern). ListBySessionIDs returns ErrNotSupported

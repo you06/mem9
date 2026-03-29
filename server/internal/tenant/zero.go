@@ -224,6 +224,13 @@ func (p *ZeroProvisioner) InitSchema(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("init schema: sessions fulltext index: %w", err)
 		}
 	}
+	// Graph index tables.
+	if _, err := db.ExecContext(ctx, TenantGraphEntitiesSchema); err != nil {
+		return fmt.Errorf("init schema: graph_entities table: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, TenantGraphEdgesSchema); err != nil {
+		return fmt.Errorf("init schema: graph_edges table: %w", err)
+	}
 	return nil
 
 }

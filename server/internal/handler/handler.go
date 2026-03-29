@@ -84,9 +84,11 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 		}
 		memRepo := repository.NewMemoryRepo(s.dbBackend, auth.TenantDB, s.autoModel, s.ftsEnabled, auth.ClusterID)
 		sessRepo := repository.NewSessionRepo(s.dbBackend, auth.TenantDB, s.autoModel, s.ftsEnabled, auth.ClusterID)
+		graphRepo := repository.NewGraphRepo(s.dbBackend, auth.TenantDB)
+		graphSvc := service.NewGraphService(graphRepo, s.llmClient)
 		svc := resolvedSvc{
-			memory:  service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
-			ingest:  service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
+			memory:  service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode, graphSvc),
+			ingest:  service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode, graphSvc),
 			session: service.NewSessionService(sessRepo, s.embedder, s.autoModel),
 		}
 		actual, loaded := s.svcCache.LoadOrStore(key, svc)
@@ -96,6 +98,11 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 					s.logger.Warn("sessions table migration failed",
 						"cluster_id", auth.ClusterID,
 						"err", err) // no tenant field: TenantID is empty in this branch
+				}
+				if err := s.tenant.EnsureGraphTables(context.Background(), auth.TenantDB); err != nil {
+					s.logger.Warn("graph tables migration failed",
+						"cluster_id", auth.ClusterID,
+						"err", err)
 				}
 			}()
 		}
@@ -107,9 +114,11 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 	}
 	memRepo := repository.NewMemoryRepo(s.dbBackend, auth.TenantDB, s.autoModel, s.ftsEnabled, auth.ClusterID)
 	sessRepo := repository.NewSessionRepo(s.dbBackend, auth.TenantDB, s.autoModel, s.ftsEnabled, auth.ClusterID)
+	graphRepo := repository.NewGraphRepo(s.dbBackend, auth.TenantDB)
+	graphSvc := service.NewGraphService(graphRepo, s.llmClient)
 	svc := resolvedSvc{
-		memory:  service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
-		ingest:  service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
+		memory:  service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode, graphSvc),
+		ingest:  service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode, graphSvc),
 		session: service.NewSessionService(sessRepo, s.embedder, s.autoModel),
 	}
 	actual, loaded := s.svcCache.LoadOrStore(key, svc)
@@ -117,6 +126,12 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 		go func() {
 			if err := s.tenant.EnsureSessionsTable(context.Background(), auth.TenantDB); err != nil {
 				s.logger.Warn("sessions table migration failed",
+					"cluster_id", auth.ClusterID,
+					"tenant", auth.TenantID,
+					"err", err)
+			}
+			if err := s.tenant.EnsureGraphTables(context.Background(), auth.TenantDB); err != nil {
+				s.logger.Warn("graph tables migration failed",
 					"cluster_id", auth.ClusterID,
 					"tenant", auth.TenantID,
 					"err", err)

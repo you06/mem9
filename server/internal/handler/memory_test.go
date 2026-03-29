@@ -101,8 +101,8 @@ func (s *testSessionRepo) ListBySessionIDs(context.Context, []string, int) ([]*d
 func newTestServer(memRepo *testMemoryRepo, sessRepo *testSessionRepo) *Server {
 	srv := NewServer(nil, nil, "", nil, nil, "", false, service.ModeSmart, "", slog.Default())
 	svc := resolvedSvc{
-		memory:  service.NewMemoryService(memRepo, nil, nil, "", service.ModeSmart),
-		ingest:  service.NewIngestService(memRepo, nil, nil, "", service.ModeSmart),
+		memory:  service.NewMemoryService(memRepo, nil, nil, "", service.ModeSmart, nil),
+		ingest:  service.NewIngestService(memRepo, nil, nil, "", service.ModeSmart, nil),
 		session: service.NewSessionService(sessRepo, nil, ""),
 	}
 	// Pre-populate svcCache so resolveServices returns our test services.
@@ -243,8 +243,8 @@ func TestCreateMemory_SyncMessages_Phase1Error_Returns500(t *testing.T) {
 
 	srv := NewServer(nil, nil, "", nil, llmClient, "", false, service.ModeSmart, "", slog.Default())
 	svc := resolvedSvc{
-		memory:  service.NewMemoryService(&testMemoryRepo{}, nil, nil, "", service.ModeSmart),
-		ingest:  service.NewIngestService(&testMemoryRepo{}, llmClient, nil, "", service.ModeSmart),
+		memory:  service.NewMemoryService(&testMemoryRepo{}, nil, nil, "", service.ModeSmart, nil),
+		ingest:  service.NewIngestService(&testMemoryRepo{}, llmClient, nil, "", service.ModeSmart, nil),
 		session: service.NewSessionService(&testSessionRepo{}, nil, ""),
 	}
 	srv.svcCache.Store(tenantSvcKey("db-0x0"), svc)
@@ -292,8 +292,8 @@ func TestCreateMemory_SyncMessages_StripsInjectedContext(t *testing.T) {
 	sessRepo := &testSessionRepo{}
 	srv := NewServer(nil, nil, "", nil, llmClient, "", false, service.ModeSmart, "", slog.Default())
 	svc := resolvedSvc{
-		memory:  service.NewMemoryService(&testMemoryRepo{}, nil, nil, "", service.ModeSmart),
-		ingest:  service.NewIngestService(&testMemoryRepo{}, llmClient, nil, "", service.ModeSmart),
+		memory:  service.NewMemoryService(&testMemoryRepo{}, nil, nil, "", service.ModeSmart, nil),
+		ingest:  service.NewIngestService(&testMemoryRepo{}, llmClient, nil, "", service.ModeSmart, nil),
 		session: service.NewSessionService(sessRepo, nil, ""),
 	}
 	srv.svcCache.Store(tenantSvcKey("db-0x0"), svc)
@@ -362,8 +362,8 @@ func TestCreateMemory_SyncMessages_ReconcileFailure_Returns500(t *testing.T) {
 	memRepo := &failSearchMemoryRepo{}
 	srv := NewServer(nil, nil, "", nil, llmClient, "", false, service.ModeSmart, "", slog.Default())
 	svc := resolvedSvc{
-		memory:  service.NewMemoryService(&memRepo.testMemoryRepo, nil, nil, "", service.ModeSmart),
-		ingest:  service.NewIngestService(memRepo, llmClient, nil, "", service.ModeSmart),
+		memory:  service.NewMemoryService(&memRepo.testMemoryRepo, nil, nil, "", service.ModeSmart, nil),
+		ingest:  service.NewIngestService(memRepo, llmClient, nil, "", service.ModeSmart, nil),
 		session: service.NewSessionService(&testSessionRepo{}, nil, ""),
 	}
 	srv.svcCache.Store(tenantSvcKey("db-0x0"), svc)

@@ -140,6 +140,40 @@ const TenantSessionsSchemaBase = `CREATE TABLE IF NOT EXISTS sessions (
     UNIQUE INDEX idx_sessions_dedup   (session_id, content_hash)
 )`
 
+// TenantGraphEntitiesSchema is the TiDB schema for the graph_entities table.
+const TenantGraphEntitiesSchema = `CREATE TABLE IF NOT EXISTS graph_entities (
+    id              VARCHAR(36)     PRIMARY KEY,
+    agent_id        VARCHAR(100)    NULL,
+    session_id      VARCHAR(100)    NULL,
+    canonical_name  VARCHAR(255)    NOT NULL,
+    normalized_name VARCHAR(255)    NOT NULL,
+    entity_type     VARCHAR(50)     NOT NULL,
+    mentions        INT             NOT NULL DEFAULT 1,
+    created_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_ge_agent        (agent_id),
+    UNIQUE INDEX idx_ge_normalized (normalized_name, agent_id),
+    INDEX idx_ge_type         (entity_type)
+)`
+
+// TenantGraphEdgesSchema is the TiDB schema for the graph_edges table.
+const TenantGraphEdgesSchema = `CREATE TABLE IF NOT EXISTS graph_edges (
+    id               VARCHAR(36)     PRIMARY KEY,
+    agent_id         VARCHAR(100)    NULL,
+    session_id       VARCHAR(100)    NULL,
+    src_entity_id    VARCHAR(36)     NOT NULL,
+    relation         VARCHAR(255)    NOT NULL,
+    dst_entity_id    VARCHAR(36)     NULL,
+    dst_literal      TEXT            NULL,
+    source_memory_id VARCHAR(36)     NOT NULL,
+    confidence       DOUBLE          NOT NULL DEFAULT 1.0,
+    created_at       TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_gedge_src       (src_entity_id),
+    INDEX idx_gedge_dst       (dst_entity_id),
+    INDEX idx_gedge_memory    (source_memory_id),
+    INDEX idx_gedge_agent     (agent_id)
+)`
+
 // BuildSessionsSchema builds the TiDB sessions schema with optional auto-embedding.
 func BuildSessionsSchema(autoModel string, autoDims int) string {
 	var embeddingCol string
