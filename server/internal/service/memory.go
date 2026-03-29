@@ -219,6 +219,37 @@ func (s *MemoryService) expandViaGraph(ctx context.Context, seedIDs []string, ag
 	return graphMems, graphRRF
 }
 
+// logGraphDiagnostic runs graph expansion in diagnostic mode: logs what the graph
+// leg would contribute without actually merging into search results.
+// This helps evaluate graph recall quality before re-enabling the read leg.
+func (s *MemoryService) logGraphDiagnostic(ctx context.Context, seedIDs []string, agentID string, limit int, existingMems map[string]domain.Memory) {
+	if s.graph == nil || len(seedIDs) == 0 {
+		return
+	}
+	hits, err := s.graph.ExpandFromMemories(ctx, seedIDs, agentID, limit)
+	if err != nil {
+		slog.Debug("graph diagnostic: expansion failed", "err", err)
+		return
+	}
+
+	newCount := 0
+	overlapCount := 0
+	for _, h := range hits {
+		if _, exists := existingMems[h.MemoryID]; exists {
+			overlapCount++
+		} else {
+			newCount++
+		}
+	}
+
+	slog.Info("graph diagnostic",
+		"seed_count", len(seedIDs),
+		"total_hits", len(hits),
+		"new_memories", newCount,
+		"overlap_with_hybrid", overlapCount,
+	)
+}
+
 func (s *MemoryService) paginate(results []domain.Memory, offset, limit int) ([]domain.Memory, int) {
 	return paginateResults(results, offset, limit)
 }
@@ -369,15 +400,9 @@ func (s *MemoryService) hybridSearch(ctx context.Context, filter domain.MemoryFi
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
 
-	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
+	// Graph expansion diagnostic: log what graph would contribute without merging.
 	seedIDs := topKIDs(mems, scores, limit)
-	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, fetchLimit)
-	for _, m := range graphMems {
-		if _, exists := mems[m.ID]; !exists {
-			mems[m.ID] = m
-		}
-		scores[m.ID] += graphScores[m.ID]
-	}
+	s.logGraphDiagnostic(ctx, seedIDs, filter.AgentID, fetchLimit, mems)
 
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
@@ -436,15 +461,9 @@ func (s *MemoryService) autoHybridSearch(ctx context.Context, filter domain.Memo
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
 
-	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
+	// Graph expansion diagnostic: log what graph would contribute without merging.
 	seedIDs := topKIDs(mems, scores, limit)
-	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, fetchLimit)
-	for _, m := range graphMems {
-		if _, exists := mems[m.ID]; !exists {
-			mems[m.ID] = m
-		}
-		scores[m.ID] += graphScores[m.ID]
-	}
+	s.logGraphDiagnostic(ctx, seedIDs, filter.AgentID, fetchLimit, mems)
 
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
