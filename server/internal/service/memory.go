@@ -24,6 +24,7 @@ const (
 	maxTags         = 20
 	maxBulkSize     = 100
 	defaultMinScore = 0.3
+	maxGraphExpand  = 10 // cap graph expansion to avoid flooding results with noise
 )
 
 type MemoryService struct {
@@ -430,9 +431,20 @@ func (s *MemoryService) hybridSearch(ctx context.Context, filter domain.MemoryFi
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
 
-	// Graph expansion diagnostic: log what graph would contribute without merging.
+	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
+	// Cap graph limit to min(limit, maxGraphExpand) to avoid flooding results with noise.
 	seedIDs := topKIDs(mems, scores, limit)
-	s.logGraphDiagnostic(ctx, filter.Query, seedIDs, filter.AgentID, fetchLimit, mems)
+	graphLimit := limit
+	if graphLimit > maxGraphExpand {
+		graphLimit = maxGraphExpand
+	}
+	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, graphLimit)
+	for _, m := range graphMems {
+		if _, exists := mems[m.ID]; !exists {
+			mems[m.ID] = m
+		}
+		scores[m.ID] += graphScores[m.ID]
+	}
 
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
@@ -491,9 +503,19 @@ func (s *MemoryService) autoHybridSearch(ctx context.Context, filter domain.Memo
 	scores := rrfMerge(kwResults, vecResults)
 	mems := collectMems(kwResults, vecResults)
 
-	// Graph expansion diagnostic: log what graph would contribute without merging.
+	// Graph expansion: use top-K hybrid results as seeds for 1-hop expansion.
 	seedIDs := topKIDs(mems, scores, limit)
-	s.logGraphDiagnostic(ctx, filter.Query, seedIDs, filter.AgentID, fetchLimit, mems)
+	graphLimit := limit
+	if graphLimit > maxGraphExpand {
+		graphLimit = maxGraphExpand
+	}
+	graphMems, graphScores := s.expandViaGraph(ctx, seedIDs, filter.AgentID, graphLimit)
+	for _, m := range graphMems {
+		if _, exists := mems[m.ID]; !exists {
+			mems[m.ID] = m
+		}
+		scores[m.ID] += graphScores[m.ID]
+	}
 
 	applyTypeWeights(mems, scores)
 	merged := sortByScore(mems, scores)
