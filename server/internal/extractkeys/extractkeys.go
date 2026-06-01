@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qiffang/mnemos/server/internal/keynorm"
 	"github.com/qiffang/mnemos/server/internal/llm"
@@ -254,7 +255,7 @@ Aim for a mix of predicate-fragment keys AND entity-word keys.
 		fmt.Fprintf(&b, `Output JSON with two arrays:
 {
   "native": ["...","..."],         // keys in the SAME language as the input fact
-  "translation": ["...","..."]     // keys translated to the OTHER major language (Chinese↔English) when the fact contains named entities or person/place/project references; empty array if the fact has no such entities
+  "translation": ["...","..."]     // keys in OTHER major languages used by agents (Chinese, English, Japanese — pick the languages most likely to be used to look up this fact in a future session) when the fact contains named entities or person/place/project references; empty array if the fact has no such entities or if the fact's language is the only relevant one
 }
 
 Target %d total keys across both arrays. Hard limit %d per array.
@@ -294,9 +295,14 @@ func buildRetryPrompt(content string, cfg Config, prevErr error, prevRaw string)
 	return b.String()
 }
 
+// truncate returns the first n runes of s, followed by "..." if the
+// input was longer. Counting runes (not bytes) keeps multi-byte
+// characters whole — error messages and prompt artifacts containing
+// CJK text don't end up with mojibake at the truncation boundary.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	rs := []rune(s)
+	return string(rs[:n]) + "..."
 }

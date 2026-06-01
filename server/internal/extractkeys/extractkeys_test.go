@@ -289,6 +289,30 @@ func TestExtract_TimeoutSurfacesError(t *testing.T) {
 	}
 }
 
+// TestTruncate_UTF8Safe pins the rune-counted truncate so error messages
+// containing CJK don't produce mojibake at the boundary.
+func TestTruncate_UTF8Safe(t *testing.T) {
+	// 5 Chinese chars = 15 bytes in UTF-8.
+	s := "用户住在千叶"
+	got := truncate(s, 3)
+	want := "用户住..."
+	if got != want {
+		t.Errorf("truncate(%q, 3) = %q, want %q", s, got, want)
+	}
+
+	// Mixed ASCII + CJK; first 5 runes are "abc用户".
+	got = truncate("abc用户在千叶", 5)
+	want = "abc用户..."
+	if got != want {
+		t.Errorf("truncate mixed = %q, want %q", got, want)
+	}
+
+	// Shorter than limit returns unchanged.
+	if got := truncate("short", 100); got != "short" {
+		t.Errorf("truncate short = %q, want %q", got, "short")
+	}
+}
+
 func TestExtract_PromptIncludesTranslationWhenEnabled(t *testing.T) {
 	// We can't directly inspect the prompt from outside, but we can check
 	// the system prompt builder.
