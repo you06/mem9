@@ -70,6 +70,12 @@ type RecallKVResult struct {
 //
 // queryVec MAY be nil. Vector paths gracefully degrade to no-candidates
 // when queryVec is nil even if their bit is set.
+//
+// The returned slice length MAY be smaller than `limit` even when more
+// than `limit` rows were RRF-ranked: hydrateValues filters on
+// state='active' to avoid surfacing soft-deleted rows under a race
+// where a concurrent writer flipped state between candidate fetch and
+// hydration. Callers should treat the result size as best-effort.
 func (r *MemoryRepo) RecallKV(
 	ctx context.Context,
 	query string,
@@ -152,8 +158,11 @@ func (r *MemoryRepo) RecallKV(
 	return out, nil
 }
 
-// fastPathLookup runs the KEY_EXACT path: WHERE key_norm = ? LIMIT 1.
-// Returns nil, nil on miss.
+// fastPathLookup runs the KEY_EXACT path: WHERE key_norm = ? LIMIT 1,
+// JOINed to memory_values for state='active' filtering so K rows
+// belonging to a soft-deleted V don't surface here. This matches the
+// K-FTS / K-VEC paths which apply the same JOIN filter. Returns
+// (nil, nil) on miss.
 func (r *MemoryRepo) fastPathLookup(ctx context.Context, query string) (*domain.Memory, error) {
 	norm := keynorm.NormalizeKey(query)
 	if norm == "" {
@@ -161,7 +170,11 @@ func (r *MemoryRepo) fastPathLookup(ctx context.Context, query string) (*domain.
 	}
 	var valueID string
 	err := r.db.QueryRowContext(ctx,
-		`SELECT memory_value_id FROM memory_keys WHERE key_norm = ? LIMIT 1`,
+		`SELECT mk.memory_value_id
+		 FROM memory_keys mk
+		 JOIN memory_values mv ON mv.id = mk.memory_value_id
+		 WHERE mk.key_norm = ? AND mv.state = 'active'
+		 LIMIT 1`,
 		norm,
 	).Scan(&valueID)
 	if errors.Is(err, sql.ErrNoRows) {
