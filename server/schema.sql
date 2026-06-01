@@ -158,6 +158,93 @@ CREATE TABLE IF NOT EXISTS memories (
 -- ALTER TABLE memories DROP COLUMN tombstone;
 -- DROP INDEX idx_tombstone ON memories;
 
+
+-- K=>V recall refactor (feat/k-v-recall).
+-- Two-table split: memory_values holds the canonical fact (V); memory_keys
+-- holds query-side aliases (K) that point to a V via FK. Multiple K can
+-- reference the same V. Recall queries hit both tables (fast path + RRF
+-- over K-FTS / V-FTS / K-VEC / V-VEC subset, gated by retrieval_strategy
+-- bitmask).
+--
+-- Step-1 migration: additive. The existing `memories` table is unchanged.
+-- Double-write, backfill, read switchover, and eventual drop happen in
+-- subsequent steps.
+CREATE TABLE IF NOT EXISTS memory_values (
+  id                  VARCHAR(36)     PRIMARY KEY,
+  content             MEDIUMTEXT      NOT NULL,
+  content_hash        CHAR(64)        NOT NULL    COMMENT 'sha256(NormalizeKey(content)) for dedup',
+  source              VARCHAR(100)    NULL,
+  tags                JSON            NULL,
+  metadata            JSON            NULL,
+  embedding           VECTOR(1536)    NULL,
+
+  -- Classification (mirrors memories.memory_type).
+  memory_type         VARCHAR(20)     NOT NULL DEFAULT 'pinned'
+                      COMMENT 'pinned|insight|digest',
+
+  -- Agent and session provenance (mirrors memories).
+  agent_id            VARCHAR(100)    NULL,
+  session_id          VARCHAR(100)    NULL,
+
+  -- Lifecycle (mirrors memories).
+  state               VARCHAR(20)     NOT NULL DEFAULT 'active'
+                      COMMENT 'active|paused|archived|deleted',
+  version             INT             DEFAULT 1,
+  updated_by          VARCHAR(100)    NULL,
+  created_at          TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  superseded_by       VARCHAR(36)     NULL,
+
+  -- K-extraction lifecycle. NULL = never extracted (orphan, eligible for
+  -- backfill). Set on every successful extract_keys call, including the
+  -- "extracted 0 keys" case. Timeout/error leaves it NULL for retry.
+  keys_extracted_at   TIMESTAMP       NULL,
+
+  UNIQUE KEY uq_content_hash      (content_hash),
+  INDEX idx_mv_memory_type        (memory_type),
+  INDEX idx_mv_source             (source),
+  INDEX idx_mv_state              (state),
+  INDEX idx_mv_agent              (agent_id),
+  INDEX idx_mv_session            (session_id),
+  INDEX idx_mv_updated            (updated_at),
+  INDEX idx_mv_keys_extracted_at  (keys_extracted_at)
+);
+
+-- FULLTEXT and VECTOR indexes for memory_values:
+-- ALTER TABLE memory_values
+--   ADD FULLTEXT INDEX idx_mv_fts_content (content)
+--   WITH PARSER MULTILINGUAL
+--   ADD_COLUMNAR_REPLICA_ON_DEMAND;
+-- ALTER TABLE memory_values ADD VECTOR INDEX idx_mv_vec_cosine ((VEC_COSINE_DISTANCE(embedding)));
+
+CREATE TABLE IF NOT EXISTS memory_keys (
+  id                  VARCHAR(36)     PRIMARY KEY,
+  memory_value_id     VARCHAR(36)     NOT NULL,
+  key_text            VARCHAR(512)    NOT NULL    COMMENT 'Original surface of the key',
+  key_norm            VARCHAR(512)    NOT NULL    COMMENT 'NormalizeKey(key_text); fast-path equality target',
+  key_embedding       VECTOR(1536)    NULL        COMMENT 'NULL until K-VEC ablation backfill',
+  source              VARCHAR(20)     NOT NULL DEFAULT 'extract'
+                      COMMENT 'extract|extract_translation|user|feedback',
+  weight              FLOAT           NOT NULL DEFAULT 1.0,
+  created_at          TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT fk_memory_keys_value
+    FOREIGN KEY (memory_value_id) REFERENCES memory_values(id) ON DELETE CASCADE,
+
+  -- Same V can't carry duplicate aliases (normalized form).
+  UNIQUE KEY uq_value_key_norm    (memory_value_id, key_norm),
+  INDEX idx_mk_value              (memory_value_id),
+  INDEX idx_mk_source             (source)
+);
+
+-- FULLTEXT and VECTOR indexes for memory_keys:
+-- ALTER TABLE memory_keys
+--   ADD FULLTEXT INDEX idx_mk_fts_key_text (key_text)
+--   WITH PARSER MULTILINGUAL
+--   ADD_COLUMNAR_REPLICA_ON_DEMAND;
+-- ALTER TABLE memory_keys ADD VECTOR INDEX idx_mk_vec_cosine ((VEC_COSINE_DISTANCE(key_embedding)));
+
+
 -- Marketing attribution captured at provision time (control plane).
 CREATE TABLE IF NOT EXISTS tenant_utm (
   tenant_id  VARCHAR(36)   NOT NULL PRIMARY KEY,
