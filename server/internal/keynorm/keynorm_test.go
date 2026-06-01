@@ -85,6 +85,84 @@ func TestNormalizeKey_Idempotent(t *testing.T) {
 	}
 }
 
+// TestCanonicalizeValue documents the V-dedup semantics: NFKC + lowercase
+// + whitespace fold + trim, but NO punctuation strip. Two facts that
+// differ only in punctuation must NOT collide.
+func TestCanonicalizeValue(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "whitespace_only", in: "  \t\n  ", want: ""},
+
+		// Punctuation kept — these differ from NormalizeKey output.
+		{name: "english_period", in: "User lives in Chiba.", want: "user lives in chiba."},
+		{name: "english_apostrophe", in: "user's home", want: "user's home"},
+		{name: "english_question", in: "Where?", want: "where?"},
+		{name: "chinese_period", in: "用户住在千叶。", want: "用户住在千叶。"},
+		{name: "chinese_enum", in: "苹果、橘子、香蕉。", want: "苹果、橘子、香蕉。"},
+
+		// NFKC + lowercase still apply.
+		{name: "caps", in: "User Lives In Chiba", want: "user lives in chiba"},
+		{name: "fullwidth", in: "ＵＳＥＲ ＬＩＶＥＳ", want: "user lives"},
+
+		// Whitespace fold still applies.
+		{name: "multispace", in: "  hello   world  ", want: "hello world"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := CanonicalizeValue(tc.in)
+			if got != tc.want {
+				t.Errorf("CanonicalizeValue(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCanonicalizeValue_PunctuationDifferentiates is the critical contract:
+// two facts that differ only in punctuation hash to different values. This
+// is the property NormalizeKey would have violated, which is why we have
+// a separate CanonicalizeValue.
+func TestCanonicalizeValue_PunctuationDifferentiates(t *testing.T) {
+	pairs := []struct {
+		a, b string
+	}{
+		{"A. B.", "A B"},
+		{"User's home", "Users home"},
+		{"hello, world", "hello world"},
+		{"苹果、橘子", "苹果 橘子"},
+	}
+	for _, p := range pairs {
+		ha := HashValue(p.a)
+		hb := HashValue(p.b)
+		if ha == hb {
+			t.Errorf("punctuation should differentiate: HashValue(%q) == HashValue(%q) == %q", p.a, p.b, ha)
+		}
+	}
+}
+
+func TestHashValue_DeterministicAndIdempotent(t *testing.T) {
+	in := "User Lives in Chiba."
+	h1 := HashValue(in)
+	h2 := HashValue(in)
+	if h1 != h2 {
+		t.Errorf("HashValue not deterministic: %q vs %q", h1, h2)
+	}
+	if len(h1) != 64 {
+		t.Errorf("HashValue length = %d, want 64 (hex sha256)", len(h1))
+	}
+
+	// CanonicalizeValue is idempotent.
+	once := CanonicalizeValue(in)
+	twice := CanonicalizeValue(once)
+	if once != twice {
+		t.Errorf("CanonicalizeValue not idempotent: %q → %q", once, twice)
+	}
+}
+
 // TestNormalizeKey_FastPathSymmetry documents the contract the keynorm
 // package promises to extract_keys.go and the query side: a stored
 // memory_keys.key_norm and a query-side normalized form match exactly

@@ -39,6 +39,8 @@
 package keynorm
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"unicode"
 
@@ -111,4 +113,51 @@ func NormalizeKey(s string) string {
 
 	// Step 5: trim trailing space if any (leading was suppressed above).
 	return strings.TrimRight(b.String(), " ")
+}
+
+// CanonicalizeValue normalizes V (value / fact body) for dedup hashing.
+// It is deliberately less aggressive than NormalizeKey:
+//
+//   - NFKC (so fullwidth and compatibility forms collapse)
+//   - lowercase
+//   - fold runs of whitespace into a single ASCII space
+//   - trim
+//
+// It does NOT strip punctuation. Two facts that differ only in punctuation
+// ("A. B." vs "A B") describe different things and must not collide on
+// content_hash. NormalizeKey strips punctuation because K is a short
+// retrieval surface where punctuation noise hurts equality match; V is a
+// canonical fact where punctuation carries meaning.
+//
+// Empty input returns "".
+func CanonicalizeValue(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = norm.NFKC.String(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := true
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			if !prevSpace {
+				b.WriteRune(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		b.WriteRune(unicode.ToLower(r))
+		prevSpace = false
+	}
+	return strings.TrimRight(b.String(), " ")
+}
+
+// HashValue returns the hex-encoded sha256 of CanonicalizeValue(content).
+// This is the function written into memory_values.content_hash by the
+// store path; the UNIQUE INDEX uq_content_hash uses it for write-path
+// dedup. CanonicalizeValue keeps punctuation, so "A. B." and "A B" hash
+// to different values (intentional — they are different facts).
+func HashValue(content string) string {
+	sum := sha256.Sum256([]byte(CanonicalizeValue(content)))
+	return hex.EncodeToString(sum[:])
 }

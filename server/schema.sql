@@ -172,7 +172,7 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE TABLE IF NOT EXISTS memory_values (
   id                  VARCHAR(36)     PRIMARY KEY,
   content             MEDIUMTEXT      NOT NULL,
-  content_hash        CHAR(64)        NOT NULL    COMMENT 'sha256(NormalizeKey(content)) for dedup',
+  content_hash        CHAR(64)        NOT NULL    COMMENT 'sha256(keynorm.HashValue(content)) for dedup; HashValue is NFKC+lowercase only (less aggressive than NormalizeKey, which is for K equality)',
   source              VARCHAR(100)    NULL,
   tags                JSON            NULL,
   metadata            JSON            NULL,
@@ -225,7 +225,8 @@ CREATE TABLE IF NOT EXISTS memory_keys (
   key_embedding       VECTOR(1536)    NULL        COMMENT 'NULL until K-VEC ablation backfill',
   source              VARCHAR(20)     NOT NULL DEFAULT 'extract'
                       COMMENT 'extract|extract_translation|user|feedback',
-  weight              FLOAT           NOT NULL DEFAULT 1.0,
+  weight              FLOAT           NOT NULL DEFAULT 1.0
+                      COMMENT 'Reserved for future per-K ranking; V1 RRF treats all K hits as weight=1.0',
   created_at          TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
 
   CONSTRAINT fk_memory_keys_value
