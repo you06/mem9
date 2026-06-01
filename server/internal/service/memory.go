@@ -42,6 +42,10 @@ type MemoryService struct {
 	embedder  *embed.Embedder
 	autoModel string
 	ingest    *IngestService
+	// llmClient is captured here for the K=>V experimental path
+	// (memory_kv.go) which calls extractkeys.Extract directly without
+	// going through ingest. Step 4 of the K=>V refactor.
+	llmClient *llm.Client
 }
 
 func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, embedder *embed.Embedder, autoModel string, ingestMode IngestMode) *MemoryService {
@@ -50,95 +54,34 @@ func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, emb
 		embedder:  embedder,
 		autoModel: autoModel,
 		ingest:    NewIngestService(memories, llmClient, embedder, autoModel, ingestMode),
+		llmClient: llmClient,
 	}
 }
 
+// Create stores a memory. Step 4 of the K=>V refactor replaces the old
+// reconciliation pipeline with a direct V/K write path. Behavior change
+// from the previous reconciliation-based implementation:
+//   - Always produces exactly 1 V. Duplicate content (same hash) returns
+//     the existing V's id with count=1.
+//   - The previous "may produce 0 or N insights based on LLM merge
+//     decisions" semantic is gone; dedup is now mechanical via
+//     content_hash.
+//   - LLM is now only used for K (retrieval-key) extraction, not for
+//     content reconciliation/merging.
+//
+// API signature unchanged so HTTP/CLI/dashboard callers are unaffected.
 func (s *MemoryService) Create(ctx context.Context, agentID, content string, tags []string, metadata json.RawMessage) (*domain.Memory, int, error) {
 	if err := validateMemoryInput(content, tags); err != nil {
 		return nil, 0, err
 	}
 
-	if s.ingest == nil {
-		return nil, 0, fmt.Errorf("ingest service not configured")
-	}
-
-	if !s.ingest.HasLLM() {
-		// Keep no-LLM create as a single write so API semantics remain predictable.
-		// This branch intentionally avoids a "create then patch tags/metadata" flow,
-		// which could otherwise return an error after content is already persisted.
-		var embedding []float32
-		if s.autoModel == "" && s.embedder != nil {
-			embeddingResult, embedErr := s.embedder.Embed(ctx, content)
-			if embedErr != nil {
-				return nil, 0, fmt.Errorf("embed raw content: %w", embedErr)
-			}
-			embedding = embeddingResult
-		}
-
-		now := time.Now()
-		mem := &domain.Memory{
-			ID:         uuid.New().String(),
-			Content:    content,
-			Source:     agentID,
-			Tags:       tags,
-			Metadata:   metadata,
-			Embedding:  embedding,
-			MemoryType: domain.TypeInsight,
-			AgentID:    agentID,
-			State:      domain.StateActive,
-			Version:    1,
-			UpdatedBy:  agentID,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		}
-		writeStart := time.Now()
-		err := s.memories.Create(ctx, mem)
-		metrics.MemoryWriteDuration.WithLabelValues("create", metricStatus(err)).Observe(time.Since(writeStart).Seconds())
-		if err != nil {
-			return nil, 0, fmt.Errorf("create raw memory: %w", err)
-		}
-		return mem, 1, nil
-	}
-
-	result, err := s.ingest.ReconcileContent(ctx, agentID, agentID, "", []string{content})
+	writeStart := time.Now()
+	mem, err := s.storeKV(ctx, agentID, content, tags, metadata)
+	metrics.MemoryWriteDuration.WithLabelValues("create", metricStatus(err)).Observe(time.Since(writeStart).Seconds())
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("create k=>v memory: %w", err)
 	}
-
-	if result.Status == "failed" {
-		return nil, 0, fmt.Errorf("content reconciliation failed")
-	}
-	if len(result.InsightIDs) == 0 {
-		return nil, 0, nil
-	}
-
-	// Apply user-provided tags/metadata to all created insights.
-	patchWrites := 0
-	for _, id := range result.InsightIDs {
-		mem, err := s.memories.GetByID(ctx, id)
-		if err != nil {
-			continue
-		}
-		if len(tags) > 0 {
-			mem.Tags = tags
-		}
-		if len(metadata) > 0 {
-			mem.Metadata = metadata
-		}
-		if len(tags) > 0 || len(metadata) > 0 {
-			if err := s.memories.UpdateOptimistic(ctx, mem, 0); err == nil {
-				patchWrites++
-			}
-		}
-	}
-
-	latestID := result.InsightIDs[len(result.InsightIDs)-1]
-	mem, getErr := s.memories.GetByID(ctx, latestID)
-	if getErr != nil {
-		return nil, 0, fmt.Errorf("fetch reconciled memory %s: %w", latestID, getErr)
-	}
-	return mem, result.MemoriesChanged + patchWrites, nil
-
+	return mem, 1, nil
 }
 
 func (s *MemoryService) CreatePinned(ctx context.Context, agentID, content string, tags []string, metadata json.RawMessage) (*domain.Memory, int, error) {
@@ -165,6 +108,15 @@ func (s *MemoryService) Get(ctx context.Context, id string) (*domain.Memory, err
 	return s.memories.GetByID(ctx, id)
 }
 
+// Search retrieves memories. Step 4 of the K=>V refactor replaces all
+// previous search variants (autoHybridSearch / hybridSearch /
+// ftsOnlySearch / keywordOnlySearch) with a single RecallKV path using
+// the V1 default strategy (KEY_EXACT | KEY_FTS | VAL_FTS).
+//
+// Empty-query (list-by-filter) requests still go through the legacy
+// memories.List path — K=>V recall only kicks in when there's a query.
+//
+// API signature unchanged.
 func (s *MemoryService) Search(ctx context.Context, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
 	if filter.Query == "" {
 		mems, total, err := s.memories.List(ctx, filter)
@@ -173,6 +125,26 @@ func (s *MemoryService) Search(ctx context.Context, filter domain.MemoryFilter) 
 		}
 		return finalizeSearchResults(mems, filter.Query), total, nil
 	}
+
+	slog.Info("memory search (k=>v)", "query_len", len(filter.Query))
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	results, err := s.recallKV(ctx, filter.Query, nil, 0, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	finalized := finalizeSearchResults(results, filter.Query)
+	return finalized, len(finalized), nil
+}
+
+// searchLegacyDispatch is the pre-step-4 search dispatcher, kept here
+// as dead code for reference / quick rollback during the experimental
+// phase. It is no longer reachable from Search.
+//
+//nolint:unused
+func (s *MemoryService) searchLegacyDispatch(ctx context.Context, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
 	searchFilter := filter
 	searchFilter.SessionID = ""
 	searchFilter.Source = ""
