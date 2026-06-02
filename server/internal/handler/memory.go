@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -498,44 +497,60 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ingestMessages runs the full ingest pipeline: optional BulkCreate → ExtractPhase1 → optional PatchTags + ReconcilePhase2.
-// TODO: wrap all database writes (BulkCreate, PatchTags, ReconcilePhase2) in a single transaction to guarantee atomicity.
+// ingestMessages routes a messages-shape memory_store request through
+// the K=>V store path (step 4.3 of the K=>V refactor).
+//
+// Pre-K=>V, this function ran a multi-phase pipeline:
+//
+//	session BulkCreate
+//	  → ExtractPhase1 (LLM extracts facts from messages)
+//	    → ReconcilePhase2 (LLM merges facts against existing memories)
+//	      → (optional) reconcileRoutedChainFacts
+//
+// That pipeline wrote to the legacy `memories` table. The K=>V refactor
+// replaces that write path; per @tmgg06's 2026-06-02 scope decision
+// ("memory_store must work via K=>V; kimi-code uses the messages
+// shape"), this function now concatenates the user-role messages'
+// content and runs it through svc.memory.Create — which step 4 already
+// switched to extractkeys.Extract + repo.UpsertMemoryValue +
+// repo.InsertMemoryKeys.
+//
+// Behavior changes vs the pre-K=>V pipeline (documented):
+//   - Always produces exactly 1 V per request (was: 0..N facts each
+//     extracted into separate insights).
+//   - LLM is used for K (retrieval-key) extraction only, not for fact
+//     extraction from messages or for content reconciliation.
+//   - Reconciliation/merge/insight-detection semantics are gone; the
+//     content_hash dedup at the repo layer handles "same content seen
+//     before"; multi-K alias handles "same fact, multiple phrasings".
+//
+// Preserved: session BulkCreate (raw conversation persistence) still
+// runs best-effort, so /session-messages keeps working independent of
+// the memory write path.
 func (s *Server) ingestMessages(ctx context.Context, auth *domain.AuthInfo, svc resolvedSvc, req service.IngestRequest, chainAuth *domain.AuthInfo) (*service.IngestResult, error) {
 	start := time.Now()
 	var (
-		bulkCreateDuration    time.Duration
-		extractPhase1Duration time.Duration
-		patchTagsDuration     time.Duration
-		reconcileDuration     time.Duration
-		routeDuration         time.Duration
-		factsCount            int
-		routedChanged         int
-		status                = "ok"
+		bulkCreateDuration time.Duration
+		storeDuration      time.Duration
+		status             = "ok"
 	)
 	defer func() {
-		s.logger.Info("messages ingest timings",
+		s.logger.Info("messages ingest timings (k=>v)",
 			"session", req.SessionID,
 			"messages", len(req.Messages),
-			"facts", factsCount,
 			"status", status,
 			"bulk_create_ms", bulkCreateDuration.Milliseconds(),
-			"extract_phase1_ms", extractPhase1Duration.Milliseconds(),
-			"patch_tags_ms", patchTagsDuration.Milliseconds(),
-			"reconcile_phase2_ms", reconcileDuration.Milliseconds(),
-			"route_ms", routeDuration.Milliseconds(),
-			"routed_changed", routedChanged,
+			"store_ms", storeDuration.Milliseconds(),
 			"total_ms", time.Since(start).Milliseconds(),
 		)
 	}()
+	_ = chainAuth // chain-routed reconcile is not part of the K=>V path
 
 	// Strip plugin-injected context (e.g. <relevant-memories>) before any storage or LLM path.
-	// This is the single sanitization point for the handler-driven pipeline (BulkCreate, ExtractPhase1, etc.).
 	req.Messages = service.StripInjectedContext(req.Messages)
 
 	if !req.DisableSessionSave {
 		// Session persistence is best-effort for both sync and async paths.
-		// sync=true guarantees only that reconcile (memory extraction) completed —
-		// raw session rows in /session-messages may be absent if BulkCreate fails.
 		bulkCreateStart := time.Now()
 		if err := svc.session.BulkCreate(ctx, auth.AgentName, req); err != nil {
 			slog.Error("session raw save failed",
@@ -544,80 +559,63 @@ func (s *Server) ingestMessages(ctx context.Context, auth *domain.AuthInfo, svc 
 		bulkCreateDuration = time.Since(bulkCreateStart)
 	}
 
-	extractPhase1Start := time.Now()
-	phase1, err := svc.ingest.ExtractPhase1WithRouting(ctx, req.Messages, chainRoutingTargets(chainAuth))
-	extractPhase1Duration = time.Since(extractPhase1Start)
+	// Concatenate user-role messages' content as the canonical V text.
+	// Assistant-role messages are reply text and don't carry the fact.
+	content := concatUserMessages(req.Messages)
+	if strings.TrimSpace(content) == "" {
+		status = "empty_user_content"
+		return &service.IngestResult{Status: "complete"}, nil
+	}
+
+	storeStart := time.Now()
+	mem, _, err := svc.memory.Create(ctx, req.AgentID, content, nil, nil)
+	storeDuration = time.Since(storeStart)
 	if err != nil {
-		status = "phase1_error"
-		slog.Error("phase1 extraction failed", "session", req.SessionID, "err", err)
-		return nil, fmt.Errorf("phase1 extraction: %w", err)
-	}
-	factsCount = len(phase1.Facts)
-
-	var wg sync.WaitGroup
-	var reconcileResult *service.IngestResult
-	var reconcileErr error
-
-	if !req.DisableSessionSave {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			patchTagsStart := time.Now()
-			defer func() {
-				patchTagsDuration = time.Since(patchTagsStart)
-			}()
-			for i, msg := range req.Messages {
-				tags := tagsAtIndex(phase1.MessageTags, i)
-				if len(tags) == 0 {
-					continue
-				}
-				hash := service.SessionContentHash(req.SessionID, msg.Role, msg.Content, msg.Seq)
-				if err := svc.session.PatchTags(ctx, req.SessionID, hash, tags); err != nil {
-					slog.Warn("session tag patch failed",
-						"cluster_id", auth.ClusterID, "session", req.SessionID, "err", err)
-				}
-			}
-		}()
+		status = "store_kv_error"
+		slog.Error("k=>v store failed", "session", req.SessionID, "err", err)
+		return nil, fmt.Errorf("k=>v store: %w", err)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		reconcileStart := time.Now()
-		defer func() {
-			reconcileDuration = time.Since(reconcileStart)
-		}()
-		reconcileResult, reconcileErr = svc.ingest.ReconcilePhase2(
-			ctx, auth.AgentName, req.AgentID, req.SessionID, phase1.Facts)
-	}()
-
-	wg.Wait()
-
-	if reconcileErr != nil {
-		status = "reconcile_error"
-		slog.Error("memories reconcile failed", "session", req.SessionID, "err", reconcileErr)
-		return nil, fmt.Errorf("reconcile: %w", reconcileErr)
+	reconcileResult := &service.IngestResult{Status: "complete", MemoriesChanged: 1}
+	if mem != nil {
+		reconcileResult.InsightIDs = []string{mem.ID}
 	}
-	if reconcileResult != nil {
+	var reconcileErr error // K=>V doesn't run reconciliation; preserved for shape-compat below
+	_ = reconcileErr
+
+	// svc.memory.Create above is the entire write path now (K=>V replaces
+	// the previous Extract/Reconcile/route pipeline). reconcileResult is
+	// the IngestResult shape preserved for HTTP response compatibility.
+	if reconcileResult.Status != "" {
 		status = reconcileResult.Status
 	}
-	if chainAuth != nil && len(phase1.Facts) > 0 {
-		routeStart := time.Now()
-		routed := s.reconcileRoutedChainFacts(ctx, chainAuth, req, phase1.Facts)
-		routeDuration = time.Since(routeStart)
-		routedChanged = routed.memoriesChanged
-		if reconcileResult == nil {
-			reconcileResult = &service.IngestResult{Status: "complete"}
-		}
-		reconcileResult.MemoriesChanged += routed.memoriesChanged
-		reconcileResult.InsightIDs = append(reconcileResult.InsightIDs, routed.insightIDs...)
-		reconcileResult.Warnings += routed.warnings
-		if reconcileResult.Status == "" {
-			reconcileResult.Status = "complete"
-		}
-	}
-
 	return reconcileResult, nil
+}
+
+// concatUserMessages flattens IngestMessages' user-role content into a
+// single string used as the V's content by the K=>V store path. Assistant
+// turns are skipped (they are reply text, not the fact to remember).
+// System / tool messages are also skipped. Trims whitespace and joins
+// with "\n\n" to keep multi-turn user inputs separable.
+func concatUserMessages(messages []service.IngestMessage) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		if m.Role != "" && m.Role != "user" {
+			continue
+		}
+		t := strings.TrimSpace(m.Content)
+		if t == "" {
+			continue
+		}
+		parts = append(parts, t)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func (s *Server) createSmartContentWithRouting(ctx context.Context, chainAuth *domain.AuthInfo, svc resolvedSvc, routingTargets []service.RoutingTarget, agentName, agentID, sessionID, content string, tags []string, metadata json.RawMessage) (*service.IngestResult, error) {

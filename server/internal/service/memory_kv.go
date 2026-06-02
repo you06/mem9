@@ -66,7 +66,12 @@ func (s *MemoryService) storeKV(
 ) (*domain.Memory, error) {
 	repo, err := s.kvRepo()
 	if err != nil {
-		return nil, err
+		// Backend doesn't support K=>V (postgres / db9 / test mocks).
+		// Fall back to legacy repo.Create against the old `memories`
+		// table. The caller still gets a valid *domain.Memory; only the
+		// K=>V indexing layer is unavailable. Production TiDB deployments
+		// always have *tidb.MemoryRepo and won't hit this branch.
+		return s.storeLegacyFallback(ctx, agentID, content, tags, metadata)
 	}
 
 	// Step 1: embed (eager, so VAL_VEC works in future ablation).
@@ -178,6 +183,48 @@ func (s *MemoryService) recallKV(
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// storeLegacyFallback writes a single memory through the legacy
+// repository.MemoryRepo.Create path. Triggered when kvRepo() fails
+// (backend doesn't satisfy *tidb.MemoryRepo). Keeps non-TiDB test
+// environments and postgres/db9 deployments functional without
+// requiring them to opt into K=>V; production TiDB deployments never
+// enter this branch because *tidb.MemoryRepo always satisfies kvRepo.
+func (s *MemoryService) storeLegacyFallback(
+	ctx context.Context,
+	agentID, content string,
+	tags []string,
+	metadata []byte,
+) (*domain.Memory, error) {
+	var embedding []float32
+	if s.autoModel == "" && s.embedder != nil {
+		v, err := s.embedder.Embed(ctx, content)
+		if err != nil {
+			return nil, fmt.Errorf("store_legacy embed: %w", err)
+		}
+		embedding = v
+	}
+	now := time.Now()
+	mem := &domain.Memory{
+		ID:         uuid.New().String(),
+		Content:    content,
+		Source:     agentID,
+		Tags:       tags,
+		Metadata:   metadata,
+		Embedding:  embedding,
+		MemoryType: domain.TypeInsight,
+		AgentID:    agentID,
+		State:      domain.StateActive,
+		Version:    1,
+		UpdatedBy:  agentID,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := s.memories.Create(ctx, mem); err != nil {
+		return nil, fmt.Errorf("store_legacy: %w", err)
+	}
+	return mem, nil
 }
 
 // validateExtractedKeySources defensively filters out any keys whose
