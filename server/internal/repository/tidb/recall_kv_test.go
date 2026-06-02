@@ -30,11 +30,16 @@ func TestRetrievalStrategy_BitValues(t *testing.T) {
 }
 
 func TestRetrievalStrategy_DefaultV1(t *testing.T) {
-	// V1 default = fast path + K-FTS + V-FTS, NO vector paths.
-	// Locked in #mem9-discussion:9dcf4b01.
-	want := RetrievalStrategy(0x0B) // = KEY_EXACT | KEY_FTS | VAL_FTS
+	// Step 4.5 turned on the vector bits: V1 default is now all 5
+	// strategy bits (fast path + K-FTS + K-VEC + V-FTS + V-VEC).
+	// @tmgg06 observed FTS-only recall was unstable when query
+	// tokens didn't overlap stored K text; vector recall provides
+	// semantic-match fallback. Vector paths use VEC_EMBED_COSINE_DISTANCE
+	// when autoModel is configured (server-side embedding) or
+	// VEC_COSINE_DISTANCE with caller queryVec otherwise.
+	want := RetrievalStrategy(0x1F) // = KEY_EXACT | KEY_FTS | KEY_VEC | VAL_FTS | VAL_VEC
 	if StrategyDefaultV1 != want {
-		t.Errorf("StrategyDefaultV1 = 0x%02X, want 0x%02X (KEY_EXACT|KEY_FTS|VAL_FTS)",
+		t.Errorf("StrategyDefaultV1 = 0x%02X, want 0x%02X (all 5 bits)",
 			uint8(StrategyDefaultV1), uint8(want))
 	}
 
@@ -45,14 +50,14 @@ func TestRetrievalStrategy_DefaultV1(t *testing.T) {
 	if StrategyDefaultV1&StrategyKeyFTS == 0 {
 		t.Error("V1 default missing KEY_FTS")
 	}
+	if StrategyDefaultV1&StrategyKeyVec == 0 {
+		t.Error("V1 default missing KEY_VEC (step 4.5 turned this on)")
+	}
 	if StrategyDefaultV1&StrategyValFTS == 0 {
 		t.Error("V1 default missing VAL_FTS")
 	}
-	if StrategyDefaultV1&StrategyKeyVec != 0 {
-		t.Error("V1 default unexpectedly has KEY_VEC (vector paths should be off in V1)")
-	}
-	if StrategyDefaultV1&StrategyValVec != 0 {
-		t.Error("V1 default unexpectedly has VAL_VEC (vector paths should be off in V1)")
+	if StrategyDefaultV1&StrategyValVec == 0 {
+		t.Error("V1 default missing VAL_VEC (step 4.5 turned this on)")
 	}
 }
 

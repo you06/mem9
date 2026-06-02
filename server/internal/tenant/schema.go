@@ -201,15 +201,16 @@ const TenantMemoryValuesSchemaBase = `CREATE TABLE IF NOT EXISTS memory_values (
 )`
 
 // TenantMemoryKeysSchemaBase is the TiDB schema for the K=>V K (key alias) table.
-// key_embedding is left as NULL VECTOR — V1 doesn't generate K embeddings
-// (StrategyDefaultV1 = 0x0B has KEY_VEC off); the column is reserved for
-// future ablation when KEY_VEC is enabled.
+// The %s placeholder is the full key_embedding column type spec
+// (e.g. "VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT(...)) STORED" or
+// "VECTOR(1536) NULL"), injected by BuildMemoryKeysSchema based on
+// autoModel availability.
 const TenantMemoryKeysSchemaBase = `CREATE TABLE IF NOT EXISTS memory_keys (
     id              VARCHAR(36)   PRIMARY KEY,
     memory_value_id VARCHAR(36)   NOT NULL,
     key_text        VARCHAR(512)  NOT NULL,
     key_norm        VARCHAR(512)  NOT NULL,
-    key_embedding   VECTOR(%d)    NULL,
+    key_embedding   %s,
     source          VARCHAR(20)   NOT NULL DEFAULT 'extract',
     weight          FLOAT         NOT NULL DEFAULT 1.0,
     created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
@@ -244,19 +245,31 @@ func BuildMemoryValuesSchema(autoModel string, autoDims int, clientDims int) str
 
 // BuildMemoryKeysSchema builds the TiDB memory_keys schema. The
 // key_embedding column dimension follows the same dim resolution as
-// memories.embedding so ablation (when KEY_VEC bit gets turned on) can
-// store keys' embeddings in the same vector space as V content. V1
-// leaves this column NULL — extractkeys.Extract does not currently
-// generate K embeddings on the write path.
+// memories.embedding so ablation can compare K and V embeddings in
+// the same vector space.
+//
+// When autoModel is set, key_embedding is a GENERATED column —
+// TiDB auto-embeds key_text on INSERT via EMBED_TEXT, the same way
+// memory_values.embedding is auto-populated from content. This keeps
+// the K-VEC recall path usable out of the box without a separate
+// client-side embedding step. When autoModel is not set, the column
+// is NULLABLE for client-side population.
 func BuildMemoryKeysSchema(autoModel string, autoDims int, clientDims int) string {
-	dims := autoDims
-	if dims <= 0 {
-		dims = clientDims
+	var embeddingCol string
+	if autoModel != "" {
+		sanitizedModel := strings.ReplaceAll(autoModel, "'", "''")
+		embeddingCol = fmt.Sprintf(
+			`VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT('%s', key_text, '{"dimensions": %d}')) STORED`,
+			autoDims, sanitizedModel, autoDims,
+		)
+	} else {
+		dims := clientDims
+		if dims <= 0 {
+			dims = 1536
+		}
+		embeddingCol = fmt.Sprintf(`VECTOR(%d) NULL`, dims)
 	}
-	if dims <= 0 {
-		dims = 1536
-	}
-	return fmt.Sprintf(TenantMemoryKeysSchemaBase, dims)
+	return fmt.Sprintf(TenantMemoryKeysSchemaBase, embeddingCol)
 }
 
 // InitTiDBTenantSchema creates or completes the TiDB tenant data-plane schema.

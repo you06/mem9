@@ -44,9 +44,14 @@ const (
 	StrategyValVec                                 // 0x10
 )
 
-// StrategyDefaultV1 is the V1 production default: fast path + K-FTS + V-FTS,
-// no vector paths. Locked in #mem9-discussion:9dcf4b01.
-const StrategyDefaultV1 = StrategyKeyExact | StrategyKeyFTS | StrategyValFTS
+// StrategyDefaultV1 is the V1 production default: fast path + all 4
+// RRF candidate paths (KEY_FTS / KEY_VEC / VAL_FTS / VAL_VEC). Step
+// 4.5 turned on the vector bits after @tmgg06 observed FTS-only
+// recall was unstable for queries whose tokens don't overlap stored
+// K text. Vector paths use VEC_EMBED_COSINE_DISTANCE under autoModel
+// (TiDB embeds the query text server-side), or VEC_COSINE_DISTANCE
+// against the caller-provided queryVec otherwise.
+const StrategyDefaultV1 = StrategyKeyExact | StrategyKeyFTS | StrategyKeyVec | StrategyValFTS | StrategyValVec
 
 // rrfK is the standard RRF damping constant (Cormack et al. 2009).
 const rrfK = 60.0
@@ -113,8 +118,8 @@ func (r *MemoryRepo) RecallKV(
 		candidateLists = append(candidateLists, ids)
 	}
 
-	if strategy&StrategyKeyVec != 0 && queryVec != nil {
-		ids, err := r.keyVecCandidates(ctx, queryVec, fanout)
+	if strategy&StrategyKeyVec != 0 && (queryVec != nil || r.autoModel != "") {
+		ids, err := r.keyVecCandidates(ctx, query, queryVec, fanout)
 		if err != nil {
 			return nil, err
 		}
@@ -129,8 +134,8 @@ func (r *MemoryRepo) RecallKV(
 		candidateLists = append(candidateLists, ids)
 	}
 
-	if strategy&StrategyValVec != 0 && queryVec != nil {
-		ids, err := r.valVecCandidates(ctx, queryVec, fanout)
+	if strategy&StrategyValVec != 0 && (queryVec != nil || r.autoModel != "") {
+		ids, err := r.valVecCandidates(ctx, query, queryVec, fanout)
 		if err != nil {
 			return nil, err
 		}
@@ -219,9 +224,21 @@ func (r *MemoryRepo) valFTSCandidates(ctx context.Context, query string, limit i
 	return scanIDList(ctx, r.db, q, limit)
 }
 
-// keyVecCandidates: K-side vector search (KEY_VEC). V1 default leaves
-// this bit off; the SQL below is included for ablation / future use.
-func (r *MemoryRepo) keyVecCandidates(ctx context.Context, queryVec []float32, limit int) ([]string, error) {
+// keyVecCandidates: K-side vector search (KEY_VEC).
+// When autoModel is configured, uses VEC_EMBED_COSINE_DISTANCE with
+// the query text (TiDB server-side embeds via EMBED_TEXT). Otherwise
+// falls back to VEC_COSINE_DISTANCE against the caller-provided
+// queryVec. queryVec is permitted to be nil under autoModel.
+func (r *MemoryRepo) keyVecCandidates(ctx context.Context, query string, queryVec []float32, limit int) ([]string, error) {
+	if r.autoModel != "" {
+		q := `SELECT mk.memory_value_id
+			FROM memory_keys mk
+			JOIN memory_values mv ON mv.id = mk.memory_value_id
+			WHERE mk.key_embedding IS NOT NULL AND mv.state = 'active'
+			ORDER BY VEC_EMBED_COSINE_DISTANCE(mk.key_embedding, ?) ASC
+			LIMIT ?`
+		return scanIDList(ctx, r.db, q, query, limit)
+	}
 	vec := vecToString(queryVec)
 	if vec == nil {
 		return nil, nil
@@ -235,9 +252,17 @@ func (r *MemoryRepo) keyVecCandidates(ctx context.Context, queryVec []float32, l
 	return scanIDList(ctx, r.db, q, vec, limit)
 }
 
-// valVecCandidates: V-side vector search (VAL_VEC). V1 default leaves
-// this bit off.
-func (r *MemoryRepo) valVecCandidates(ctx context.Context, queryVec []float32, limit int) ([]string, error) {
+// valVecCandidates: V-side vector search (VAL_VEC). Same autoModel /
+// queryVec switching as keyVecCandidates.
+func (r *MemoryRepo) valVecCandidates(ctx context.Context, query string, queryVec []float32, limit int) ([]string, error) {
+	if r.autoModel != "" {
+		q := `SELECT id
+			FROM memory_values
+			WHERE embedding IS NOT NULL AND state = 'active'
+			ORDER BY VEC_EMBED_COSINE_DISTANCE(embedding, ?) ASC
+			LIMIT ?`
+		return scanIDList(ctx, r.db, q, query, limit)
+	}
 	vec := vecToString(queryVec)
 	if vec == nil {
 		return nil, nil
