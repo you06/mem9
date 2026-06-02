@@ -5,14 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/qiffang/mnemos/server/internal/domain"
-	"github.com/qiffang/mnemos/server/internal/llm"
 )
 
 func floatEqual(a, b float64) bool {
@@ -329,65 +326,16 @@ func TestSortByScore(t *testing.T) {
 // TestSearchColdStartFallbackToKeyword verifies that when no embedder and no
 // autoModel are configured and FTS is not yet available (cold start), Search()
 // falls back to KeywordSearch instead of returning a hard error.
-func TestSearchColdStartFallbackToKeyword(t *testing.T) {
-	t.Parallel()
-
-	memRepo := &memoryRepoMock{
-		ftsAvail: false, // FTS probe still running
-		kwResults: []domain.Memory{
-			{ID: "kw-1", Content: "result from keyword search", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-	}
-
-	// No embedder, no autoModel — cold start, FTS not yet available.
-	svc := NewMemoryService(memRepo, nil, nil, "", ModeSmart)
-
-	results, total, err := svc.Search(context.Background(), domain.MemoryFilter{
-		Query: "test query",
-		Limit: 10,
-	})
-	if err != nil {
-		t.Fatalf("Search() should fall back to keyword, got error: %v", err)
-	}
-	if total != 1 {
-		t.Fatalf("expected total=1, got %d", total)
-	}
-	if len(results) != 1 || results[0].ID != "kw-1" {
-		t.Fatalf("expected kw-1 result from keyword fallback, got %v", results)
-	}
-}
-
-// TestSearchFTSOnlyWhenAvailable verifies that when FTS is available and no
-// vector search is configured, Search() uses FTS (not keyword fallback).
-func TestSearchFTSOnlyWhenAvailable(t *testing.T) {
-	t.Parallel()
-
-	memRepo := &memoryRepoMock{
-		ftsAvail: true,
-		ftsResults: []domain.Memory{
-			{ID: "fts-1", Content: "result from FTS", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-		kwResults: []domain.Memory{
-			{ID: "kw-1", Content: "should not appear"},
-		},
-	}
-
-	svc := NewMemoryService(memRepo, nil, nil, "", ModeSmart)
-
-	results, total, err := svc.Search(context.Background(), domain.MemoryFilter{
-		Query: "test query",
-		Limit: 10,
-	})
-	if err != nil {
-		t.Fatalf("Search() FTS-only error: %v", err)
-	}
-	if total != 1 {
-		t.Fatalf("expected total=1, got %d", total)
-	}
-	if len(results) != 1 || results[0].ID != "fts-1" {
-		t.Fatalf("expected fts-1 from FTS search, got %v", results)
-	}
-}
+// TestSearchColdStartFallbackToKeyword and TestSearchFTSOnlyWhenAvailable
+// were removed in step 4.1 of the K=>V refactor. Both asserted the
+// pre-K=>V Search dispatcher's branching between hybrid/FTS/keyword
+// based on availability of embedder/autoModel/FTS. Step 4 replaced
+// that dispatcher with a single repo.RecallKV call using the V1 default
+// strategy bitmask (0x0B), so the branches no longer exist.
+//
+// The Search dispatcher's pre-K=>V code is kept as searchLegacyDispatch
+// in memory.go (//nolint:unused) for reference and rollback during the
+// experimental phase; it will be deleted alongside the ablation work.
 
 // TestSearchEmptyQueryReturnsList verifies that Search() with empty query
 // delegates to List() instead of any search path.
@@ -436,62 +384,24 @@ func TestSearchEmptyQueryPopulatesRelativeAge(t *testing.T) {
 	}
 }
 
-func TestSearchIgnoresSessionAndSourceFilters(t *testing.T) {
-	t.Parallel()
+// TestSearchIgnoresSessionAndSourceFilters was removed in step 4.1 of the
+// K=>V refactor. It asserted the legacy Search dispatcher's behavior of
+// clearing Source/SessionID filters before forwarding to KeywordSearch.
+// Step 4 replaced the dispatcher with repo.RecallKV which does not
+// consume those filter fields at all; the V1 strategy (0x0B = fast path
+// + K-FTS + V-FTS) is filter-agnostic on the legacy MemoryFilter shape.
 
-	memRepo := &memoryRepoMock{
-		ftsAvail: false,
-		kwResults: []domain.Memory{
-			{ID: "kw-1", Content: "result from keyword search", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-	}
-	svc := NewMemoryService(memRepo, nil, nil, "", ModeSmart)
-
-	_, _, err := svc.Search(context.Background(), domain.MemoryFilter{
-		Query:     "test query",
-		Source:    "legacy-source",
-		SessionID: "session-123",
-		AgentID:   "agent-1",
-		Limit:     10,
-	})
-	if err != nil {
-		t.Fatalf("Search() error: %v", err)
-	}
-
-	if memRepo.lastKeywordFilter.Source != "" {
-		t.Fatalf("expected keyword search Source filter cleared, got %q", memRepo.lastKeywordFilter.Source)
-	}
-	if memRepo.lastKeywordFilter.SessionID != "" {
-		t.Fatalf("expected keyword search SessionID filter cleared, got %q", memRepo.lastKeywordFilter.SessionID)
-	}
-	if memRepo.lastKeywordFilter.AgentID != "agent-1" {
-		t.Fatalf("expected keyword search AgentID preserved, got %q", memRepo.lastKeywordFilter.AgentID)
-	}
-}
-
-func TestCreateFallsBackToRawWhenLLMUnavailable(t *testing.T) {
-	t.Parallel()
-
-	repo := &memoryRepoMock{}
-	svc := NewMemoryService(repo, nil, nil, "", ModeSmart)
-
-	mem, _, err := svc.Create(context.Background(), "agent-1", "user prefers dark mode", []string{"prefs"}, json.RawMessage(`{"source":"manual"}`))
-	if err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-	if mem == nil {
-		t.Fatal("expected created memory")
-	}
-	if len(repo.createCalls) != 1 {
-		t.Fatalf("expected 1 raw memory create, got %d", len(repo.createCalls))
-	}
-	if mem.Content != "user prefers dark mode" {
-		t.Fatalf("expected raw content unchanged, got %q", mem.Content)
-	}
-	if mem.MemoryType != domain.TypeInsight {
-		t.Fatalf("expected insight memory type, got %s", mem.MemoryType)
-	}
-}
+// TestCreateFallsBackToRawWhenLLMUnavailable was removed in step 4.1 of
+// the K=>V refactor. It asserted that the pre-K=>V Create method, when
+// no LLM was configured, would write the memory directly to the legacy
+// memories table without running reconciliation. Step 4 replaced
+// Create's reconciliation pipeline with the K=>V store path
+// (extractkeys.Extract → repo.UpsertMemoryValue → ...), which has
+// different no-LLM semantics: the V is still written but K extraction
+// returns ErrLLMUnavailable and the V is left as an orphan
+// (keys_extracted_at NULL). This is documented in the K=>V Create
+// godoc and is exercised by integration tests against a real TiDB
+// backend, not by the legacy memoryRepoMock-based unit test.
 
 func TestCreatePinnedUsesBulkCreateSemantics(t *testing.T) {
 	t.Parallel()
@@ -546,41 +456,19 @@ func TestCreatePinnedUsesBulkCreateSemantics(t *testing.T) {
 	}
 }
 
-func TestCreateRunsReconcilePipeline(t *testing.T) {
-	t.Parallel()
-
-	callCount := 0
-	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		resp := `{"facts": [{"text": "Uses Go 1.22", "tags": ["tech"]}]}`
-		if callCount == 2 {
-			resp = `{"memory": [{"id": "new", "text": "Uses Go 1.22", "event": "ADD"}]}`
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{{"message": map[string]string{"content": resp}}},
-		})
-	}))
-	defer mockLLM.Close()
-
-	llmClient := llm.New(llm.Config{APIKey: "test-key", BaseURL: mockLLM.URL, Model: "test-model"})
-	repo := &memoryRepoMock{}
-	svc := NewMemoryService(repo, llmClient, nil, "auto-model", ModeSmart)
-
-	mem, _, err := svc.Create(context.Background(), "agent-1", "I use Go 1.22", nil, nil)
-	if err != nil {
-		t.Fatalf("Create() error: %v", err)
-	}
-	if mem == nil {
-		t.Fatal("expected created memory")
-	}
-	if len(repo.createCalls) != 1 {
-		t.Fatalf("expected 1 created memory, got %d", len(repo.createCalls))
-	}
-	if repo.createCalls[0].MemoryType != domain.TypeInsight {
-		t.Fatalf("expected insight memory type, got %s", repo.createCalls[0].MemoryType)
-	}
-}
+// TestCreateRunsReconcilePipeline was removed in step 4.1 of the K=>V
+// refactor. The reconciliation pipeline (ingest.ReconcileContent: facts
+// extraction + LLM-driven merge/dedup) was the pre-K=>V mechanism for
+// "should this new content add/update/skip an existing memory". Step 4
+// replaced it with mechanical content_hash dedup at repo.UpsertMemoryValue
+// plus multi-K alias generation. The reconciliation pipeline still
+// exists in ingest.go but is no longer reachable from service.Create.
+//
+// Per @tmgg06's 2026-06-02 scope decision ("only memory_store and
+// memory_search need to work"), no replacement reconciliation test is
+// added — the K=>V store path is exercised end-to-end against real TiDB
+// in the manual smoke tests; deeper unit coverage requires a *tidb.MemoryRepo
+// fake that the legacy memoryRepoMock cannot provide.
 
 func TestRelativeAge(t *testing.T) {
 	now := time.Now()
