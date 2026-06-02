@@ -192,24 +192,29 @@ func (r *MemoryRepo) fastPathLookup(ctx context.Context, query string) (*domain.
 }
 
 // keyFTSCandidates returns memory_value_id ranked by FTS_MATCH_WORD
-// score on memory_keys.key_text. JOINs memory_values to filter on V's
-// state = 'active' (per the agreed "K state inherits V" rule).
+// score on memory_keys.key_text.
+//
+// TiDB constraint (Error 1221): FTS_MATCH_WORD must be used ALONE in
+// WHERE — no AND clauses are permitted. The K-side state filter ("only
+// surface keys belonging to active V's") is therefore enforced
+// downstream in hydrateValues (which JOINs memory_values with
+// state='active'), not here. Step 4.6 fix.
 func (r *MemoryRepo) keyFTSCandidates(ctx context.Context, query string, limit int) ([]string, error) {
 	safeQ := ftsSafeLiteral(query)
 	if safeQ == "" {
 		return nil, nil
 	}
-	q := `SELECT mk.memory_value_id
-		FROM memory_keys mk
-		JOIN memory_values mv ON mv.id = mk.memory_value_id
-		WHERE fts_match_word('` + safeQ + `', mk.key_text)
-		  AND mv.state = 'active'
-		ORDER BY fts_match_word('` + safeQ + `', mk.key_text) DESC, mk.id
+	q := `SELECT memory_value_id
+		FROM memory_keys
+		WHERE fts_match_word('` + safeQ + `', key_text)
+		ORDER BY fts_match_word('` + safeQ + `', key_text) DESC, id
 		LIMIT ?`
 	return scanIDList(ctx, r.db, q, limit)
 }
 
 // valFTSCandidates returns memory_values.id ranked by FTS on content.
+// State filter applied downstream in hydrateValues (see TiDB Error 1221
+// note on keyFTSCandidates).
 func (r *MemoryRepo) valFTSCandidates(ctx context.Context, query string, limit int) ([]string, error) {
 	safeQ := ftsSafeLiteral(query)
 	if safeQ == "" {
@@ -218,7 +223,6 @@ func (r *MemoryRepo) valFTSCandidates(ctx context.Context, query string, limit i
 	q := `SELECT id
 		FROM memory_values
 		WHERE fts_match_word('` + safeQ + `', content)
-		  AND state = 'active'
 		ORDER BY fts_match_word('` + safeQ + `', content) DESC, id
 		LIMIT ?`
 	return scanIDList(ctx, r.db, q, limit)
