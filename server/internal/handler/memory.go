@@ -724,12 +724,16 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 	} else {
 		svc := s.resolveServices(auth)
 		switch {
-		case filter.Query != "" && filter.MemoryType == "":
-			memories, total, err = s.defaultConfidenceRecallSearch(r.Context(), auth, svc, filter)
-		case filter.Query != "" && (filter.MemoryType == string(domain.TypeSession) ||
+		case filter.Query != "" && (filter.MemoryType == "" ||
+			filter.MemoryType == string(domain.TypeSession) ||
 			filter.MemoryType == string(domain.TypePinned) ||
 			filter.MemoryType == string(domain.TypeInsight)):
-			memories, total, err = s.singlePoolConfidenceRecallSearch(r.Context(), auth, svc, filter)
+			// Step 4.4: any query-driven search (regardless of memory_type)
+			// routes through svc.memory.Search → recallKV (K=>V path), not
+			// the legacy defaultConfidenceRecallSearch / singlePoolConfidence
+			// pipelines. Those pipelines hit the old memories table and
+			// silently miss data written via the K=>V store path.
+			memories, total, err = svc.memory.Search(r.Context(), filter)
 		case onlySession:
 			memories, total, err = svc.session.List(r.Context(), filter)
 		case !onlySession:
