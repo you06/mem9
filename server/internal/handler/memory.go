@@ -91,6 +91,7 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 			AgentID:            agentID,
 			Mode:               req.Mode,
 			DisableSessionSave: s.disableSessionSave || req.DisableSessionSave,
+			Metadata:           append(json.RawMessage(nil), req.Metadata...),
 		}
 
 		if req.Sync {
@@ -568,7 +569,7 @@ func (s *Server) ingestMessages(ctx context.Context, auth *domain.AuthInfo, svc 
 	}
 
 	storeStart := time.Now()
-	mem, _, err := svc.memory.Create(ctx, req.AgentID, content, nil, nil)
+	mem, _, err := svc.memory.Create(ctx, req.AgentID, content, nil, req.Metadata)
 	storeDuration = time.Since(storeStart)
 	if err != nil {
 		status = "store_kv_error"

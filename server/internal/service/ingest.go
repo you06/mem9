@@ -45,6 +45,14 @@ type IngestRequest struct {
 	AgentID            string          `json:"agent_id"`
 	Mode               IngestMode      `json:"mode"`
 	DisableSessionSave bool            `json:"disableSessionSave,omitempty"`
+	// Metadata is the caller-supplied JSON metadata blob that travels
+	// through the messages-shape ingest path and lands on the produced
+	// V's `memory_values.metadata` column. The content-shape ingest
+	// path (handler/memory.go's content branch) already plumbed
+	// metadata; this field closes the same gap on the messages-shape
+	// branch so callers like kimi-code's compaction exporter can tag
+	// each write with `{"ingest_source": "..."}` etc.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // IngestMessage represents a single conversation message.

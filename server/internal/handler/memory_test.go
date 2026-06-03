@@ -1446,6 +1446,49 @@ func TestCreateMemory_SyncMessages_Returns200(t *testing.T) {
 	}
 }
 
+func TestCreateMemory_SyncMessages_MetadataReachesV(t *testing.T) {
+	// The messages-shape ingest path historically dropped the
+	// request's `metadata` field on the floor — the K=>V refactor
+	// wired svc.memory.Create with nil metadata. This test verifies
+	// that callers (e.g. kimi-code's compaction exporter tagging
+	// writes with {"ingest_source": "kimi-code-compaction"}) now
+	// see their metadata persisted on the produced V.
+	memRepo := &testMemoryRepo{}
+	sessRepo := &testSessionRepo{}
+	srv := newTestServer(memRepo, sessRepo)
+
+	body := map[string]any{
+		"messages": []map[string]string{
+			{"role": "user", "content": "the company office is at otemachi"},
+		},
+		"session_id": "test-session",
+		"metadata":   map[string]any{"ingest_source": "kimi-code-compaction"},
+		"sync":       true,
+	}
+	req := makeRequest(t, http.MethodPost, "/memories", body)
+	rr := httptest.NewRecorder()
+
+	srv.createMemory(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(memRepo.createCalls) != 1 {
+		t.Fatalf("expected one V row to be written, got %d", len(memRepo.createCalls))
+	}
+	got := memRepo.createCalls[0].Metadata
+	if len(got) == 0 {
+		t.Fatal("expected request metadata to reach memory_values.metadata; got empty")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatalf("persisted metadata is not valid JSON: %v (raw=%s)", err, got)
+	}
+	if parsed["ingest_source"] != "kimi-code-compaction" {
+		t.Fatalf("expected ingest_source=kimi-code-compaction, got %v (full=%v)", parsed["ingest_source"], parsed)
+	}
+}
+
 func TestCreateMemory_SyncMessages_DisableSessionSaveSkipsRawSessionAndStoresFacts(t *testing.T) {
 	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
