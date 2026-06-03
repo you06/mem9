@@ -16,6 +16,7 @@ import (
 	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/metrics"
 	"github.com/qiffang/mnemos/server/internal/repository"
+	"github.com/qiffang/mnemos/server/internal/repository/tidb"
 )
 
 const (
@@ -126,12 +127,12 @@ func (s *MemoryService) Search(ctx context.Context, filter domain.MemoryFilter) 
 		return finalizeSearchResults(mems, filter.Query), total, nil
 	}
 
-	slog.Info("memory search (k=>v)", "query_len", len(filter.Query))
+	slog.Info("memory search (k=>v)", "query_len", len(filter.Query), "retrieval_strategy", filter.RetrievalStrategy)
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 10
 	}
-	results, err := s.recallKV(ctx, filter.Query, nil, 0, limit)
+	results, err := s.recallKV(ctx, filter.Query, nil, tidb.RetrievalStrategy(filter.RetrievalStrategy), limit)
 	if err != nil {
 		return nil, 0, err
 	}

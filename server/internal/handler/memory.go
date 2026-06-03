@@ -684,25 +684,31 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		tags = strings.Split(t, ",")
 	}
 
+	strategy, err := parseRetrievalStrategy(q.Get("retrieval_strategy"))
+	if err != nil {
+		s.handleError(r.Context(), w, err)
+		return
+	}
+
 	filter := domain.MemoryFilter{
-		Query:      query,
-		Tags:       tags,
-		Source:     q.Get("source"),
-		State:      q.Get("state"),
-		MemoryType: q.Get("memory_type"),
-		AgentID:    q.Get("agent_id"),
-		SessionID:  q.Get("session_id"),
-		SortBy:     q.Get("sort_by"),
-		SortDir:    q.Get("sort_dir"),
-		Limit:      limit,
-		Offset:     offset,
-		ScanAll:    parseBoolQuery(q.Get("scanAll")),
+		Query:             query,
+		Tags:              tags,
+		Source:            q.Get("source"),
+		State:             q.Get("state"),
+		MemoryType:        q.Get("memory_type"),
+		AgentID:           q.Get("agent_id"),
+		SessionID:         q.Get("session_id"),
+		SortBy:            q.Get("sort_by"),
+		SortDir:           q.Get("sort_dir"),
+		Limit:             limit,
+		Offset:            offset,
+		ScanAll:           parseBoolQuery(q.Get("scanAll")),
+		RetrievalStrategy: strategy,
 	}
 	onlySession := filter.MemoryType == string(domain.TypeSession)
 
 	var memories []domain.Memory
 	var total int
-	var err error
 	var recallLease *runtimeusage.OperationLease
 	recallFinalized := false
 
@@ -791,6 +797,36 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 func parseBoolQuery(value string) bool {
 	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
 	return err == nil && parsed
+}
+
+// parseRetrievalStrategy parses the `retrieval_strategy` query param into a
+// uint8 bitmask. Accepts decimal (`31`) or 0x-prefixed hex (`0x1F`). Empty
+// string returns 0, which downstream resolves to tidb.StrategyDefaultV1.
+//
+// Returns a 400-shaped error when the value cannot be parsed or sets bits
+// outside the supported 0x1F mask (KEY_EXACT | KEY_FTS | KEY_VEC | VAL_FTS
+// | VAL_VEC). Locked by the ablation harness contract from
+// #mem9-discussion:8a93eeb6.
+func parseRetrievalStrategy(value string) (uint8, error) {
+	s := strings.TrimSpace(value)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(s, 0, 8)
+	if err != nil {
+		return 0, &domain.ValidationError{
+			Field:   "retrieval_strategy",
+			Message: "must be an integer (decimal or 0x-prefixed hex) in the range 0..31",
+		}
+	}
+	const maxMask uint64 = 0x1F
+	if n & ^maxMask != 0 {
+		return 0, &domain.ValidationError{
+			Field:   "retrieval_strategy",
+			Message: "bits outside the 0x1F mask (KEY_EXACT|KEY_FTS|KEY_VEC|VAL_FTS|VAL_VEC) are not supported",
+		}
+	}
+	return uint8(n), nil
 }
 
 func normalizeRecallQuery(query string, now time.Time) string {
