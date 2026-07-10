@@ -55,6 +55,12 @@ type Memory struct {
 	// Populated server-side at query time for search results only; never stored.
 	RelativeAge string `json:"relative_age,omitempty"`
 
+	// MatchedQueries lists the 0-based indexes of the request's `q`
+	// parameters that recalled this memory. Populated only on
+	// multi-query searches (repeated `q`); empty/omitted otherwise.
+	// Query-time provenance, never stored.
+	MatchedQueries []int `json:"matched_queries,omitempty"`
+
 	// ChainSource is populated only when the response was produced through a Space Chain.
 	ChainSource *ChainSource `json:"chain_source,omitempty"`
 }
@@ -160,6 +166,11 @@ type MemoryFilter struct {
 	Offset     int
 	ScanAll    bool
 	MinScore   float64 // minimum cosine similarity for vector results; 0 = use default (0.3); -1 = disabled (return all)
+	// RetrievalStrategy is the K=>V recall bitmask. 0 = use server default
+	// (tidb.StrategyDefaultV1). Non-zero values must fit the 0x1F mask
+	// (KEY_EXACT | KEY_FTS | KEY_VEC | VAL_FTS | VAL_VEC). Only consulted
+	// when Query != "" and the request routes through K=>V recall.
+	RetrievalStrategy uint8
 }
 
 // TenantStatus represents the lifecycle status of a tenant.

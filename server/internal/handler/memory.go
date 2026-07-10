@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,7 +20,7 @@ import (
 )
 
 var (
-	// Keep the application timeout below the benchmark client's 10m request timeout
+	// Keep the application timeout below the client's 10m request timeout
 	// so slow sync ingest returns a structured JSON 504 instead of a socket-level abort.
 	syncIngestTimeout = 9 * time.Minute
 )
@@ -39,6 +38,31 @@ type createMemoryRequest struct {
 	Mode               service.IngestMode      `json:"mode,omitempty"`
 	Sync               bool                    `json:"sync,omitempty"`
 	DisableSessionSave bool                    `json:"disableSessionSave,omitempty"`
+	// Keys is the agent-side retrieval-key list. When non-empty, the
+	// K=>V store path skips the server-side extractkeys.Extract LLM call
+	// and uses these keys directly (after server-side validation).
+	// Empty/absent keeps the current server-extract behavior.
+	Keys []service.RetrievalKey `json:"keys,omitempty"`
+}
+
+// agentKeysCreateResponse is the sync POST response body when the
+// caller supplied agent-side retrieval_keys. The agent-side
+// Mem9MemoryStore tool parses this and surfaces accepted/rejected
+// counts back to the agent so subsequent stores can self-correct.
+// When no agent keys were supplied the handler returns the simpler
+// `{"status":"ok"}` shape for backward compatibility.
+type agentKeysCreateResponse struct {
+	Status       string                `json:"status"`
+	MemoryID     string                `json:"memory_id,omitempty"`
+	KeysInserted int                   `json:"keys_inserted"`
+	KeysRejected []service.RejectedKey `json:"keys_rejected"`
+}
+
+func memID(m *domain.Memory) string {
+	if m == nil {
+		return ""
+	}
+	return m.ID
 }
 
 func isSyncIngestTimeout(ctx context.Context, err error) bool {
@@ -101,6 +125,15 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 			AppID:              appID,
 			Mode:               req.Mode,
 			DisableSessionSave: s.disableSessionSave || req.DisableSessionSave,
+			Metadata:           append(json.RawMessage(nil), req.Metadata...),
+			// Forward agent-supplied retrieval keys so messages-shape
+			// callers (the agent's Mem9MemoryStore tool is the primary
+			// one) actually exercise the agent-K path on the server.
+			// Without this, req.Keys was unmarshalled from the body but
+			// dropped here, and every messages-shape store quietly fell
+			// back to server-side extractkeys.Extract. Caught in
+			// a code review.
+			Keys: req.Keys,
 		}
 
 		if req.Sync {
@@ -176,7 +209,29 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 			s.recordIngestMetering(auth, svc)
 			s.enqueueMemoryAddedIDWebhooks(syncCtx, auth, svc, writeChainSource, chainAuth, result)
 			go s.afterSuccessfulWrite(auth, svc, written)
-			respond(w, http.StatusOK, map[string]string{"status": "ok"})
+			// When the caller supplied agent-side retrieval keys, return
+			// the full agentKeysCreateResponse shape so the agent's
+			// Mem9MemoryStore tool can surface rejection reasons back to
+			// the agent for self-correction. Legacy callers that didn't
+			// send keys keep the simpler {"status":"ok"} shape.
+			if len(req.Keys) > 0 {
+				resp := agentKeysCreateResponse{
+					Status:       "ok",
+					KeysRejected: []service.RejectedKey{},
+				}
+				if result != nil {
+					if len(result.InsightIDs) > 0 {
+						resp.MemoryID = result.InsightIDs[0]
+					}
+					resp.KeysInserted = result.KeysInserted
+					if len(result.KeysRejected) > 0 {
+						resp.KeysRejected = result.KeysRejected
+					}
+				}
+				respond(w, http.StatusOK, resp)
+			} else {
+				respond(w, http.StatusOK, map[string]string{"status": "ok"})
+			}
 		} else {
 			var lease *runtimeusage.OperationLease
 			if s.runtimeUsageEnabled() {
@@ -386,7 +441,8 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// s.persistContentSession(r.Context(), auth, svc, req.SessionID, agentID, content, metadata)
-		mem, written, err := svc.memory.Create(r.Context(), agentID, appID, content, tags, metadata)
+		mem, written, keysInserted, keysRejected, err := svc.memory.CreateWithAgentKeys(
+			r.Context(), agentID, appID, content, tags, metadata, req.Keys)
 		if err != nil {
 			if s.runtimeUsageEnabled() {
 				s.runtimeUsage.AfterMemoryCreateFailure(context.Background(), lease, err)
@@ -421,7 +477,24 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 		}
 		s.enqueueMemoryAddedWebhook(r.Context(), auth, writeChainSource, chainAuth, mem)
 		go s.afterSuccessfulWrite(auth, svc, int64(written))
-		respond(w, http.StatusOK, map[string]string{"status": "ok"})
+		// Sync-response surfacing of agent-keys outcome: when the agent
+		// supplied retrieval_keys, return per-key inserted/rejected counts so
+		// the Mem9MemoryStore tool can show the agent which
+		// keys were dropped and why. When no agent keys were supplied
+		// we keep the legacy `{"status":"ok"}` shape to avoid
+		// surprising old callers (the keysInserted>0 / keysRejected>0
+		// conditions are unreachable when len(req.Keys)==0, so the
+		// condition simplifies to a single len check).
+		if len(req.Keys) > 0 {
+			respond(w, http.StatusOK, agentKeysCreateResponse{
+				Status:       "ok",
+				MemoryID:     memID(mem),
+				KeysInserted: keysInserted,
+				KeysRejected: keysRejected,
+			})
+		} else {
+			respond(w, http.StatusOK, map[string]string{"status": "ok"})
+		}
 	} else {
 		var lease *runtimeusage.OperationLease
 		if s.runtimeUsageEnabled() {
@@ -514,44 +587,60 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ingestMessages runs the full ingest pipeline: optional BulkCreate → ExtractPhase1 → optional PatchTags + ReconcilePhase2.
-// TODO: wrap all database writes (BulkCreate, PatchTags, ReconcilePhase2) in a single transaction to guarantee atomicity.
+// ingestMessages routes a messages-shape memory_store request through
+// the K=>V store path (step 4.3 of the K=>V refactor).
+//
+// Pre-K=>V, this function ran a multi-phase pipeline:
+//
+//	session BulkCreate
+//	  → ExtractPhase1 (LLM extracts facts from messages)
+//	    → ReconcilePhase2 (LLM merges facts against existing memories)
+//	      → (optional) reconcileRoutedChainFacts
+//
+// That pipeline wrote to the legacy `memories` table. The K=>V refactor
+// replaces that write path; per a scope decision
+// ("memory_store must work via K=>V; agent clients use the messages
+// shape"), this function now concatenates the user-role messages'
+// content and runs it through svc.memory.Create — which step 4 already
+// switched to extractkeys.Extract + repo.UpsertMemoryValue +
+// repo.InsertMemoryKeys.
+//
+// Behavior changes vs the pre-K=>V pipeline (documented):
+//   - Always produces exactly 1 V per request (was: 0..N facts each
+//     extracted into separate insights).
+//   - LLM is used for K (retrieval-key) extraction only, not for fact
+//     extraction from messages or for content reconciliation.
+//   - Reconciliation/merge/insight-detection semantics are gone; the
+//     content_hash dedup at the repo layer handles "same content seen
+//     before"; multi-K alias handles "same fact, multiple phrasings".
+//
+// Preserved: session BulkCreate (raw conversation persistence) still
+// runs best-effort, so /session-messages keeps working independent of
+// the memory write path.
 func (s *Server) ingestMessages(ctx context.Context, auth *domain.AuthInfo, svc resolvedSvc, req service.IngestRequest, chainAuth *domain.AuthInfo) (*service.IngestResult, error) {
 	start := time.Now()
 	var (
-		bulkCreateDuration    time.Duration
-		extractPhase1Duration time.Duration
-		patchTagsDuration     time.Duration
-		reconcileDuration     time.Duration
-		routeDuration         time.Duration
-		factsCount            int
-		routedChanged         int
-		status                = "ok"
+		bulkCreateDuration time.Duration
+		storeDuration      time.Duration
+		status             = "ok"
 	)
 	defer func() {
-		s.logger.Info("messages ingest timings",
+		s.logger.Info("messages ingest timings (k=>v)",
 			"session", req.SessionID,
 			"messages", len(req.Messages),
-			"facts", factsCount,
 			"status", status,
 			"bulk_create_ms", bulkCreateDuration.Milliseconds(),
-			"extract_phase1_ms", extractPhase1Duration.Milliseconds(),
-			"patch_tags_ms", patchTagsDuration.Milliseconds(),
-			"reconcile_phase2_ms", reconcileDuration.Milliseconds(),
-			"route_ms", routeDuration.Milliseconds(),
-			"routed_changed", routedChanged,
+			"store_ms", storeDuration.Milliseconds(),
 			"total_ms", time.Since(start).Milliseconds(),
 		)
 	}()
+	_ = chainAuth // chain-routed reconcile is not part of the K=>V path
 
 	// Strip plugin-injected context (e.g. <relevant-memories>) before any storage or LLM path.
-	// This is the single sanitization point for the handler-driven pipeline (BulkCreate, ExtractPhase1, etc.).
 	req.Messages = service.StripInjectedContext(req.Messages)
 
 	if !req.DisableSessionSave {
 		// Session persistence is best-effort for both sync and async paths.
-		// sync=true guarantees only that reconcile (memory extraction) completed —
-		// raw session rows in /session-messages may be absent if BulkCreate fails.
 		bulkCreateStart := time.Now()
 		if err := svc.session.BulkCreate(ctx, auth.AgentName, req); err != nil {
 			slog.Error("session raw save failed",
@@ -560,80 +649,74 @@ func (s *Server) ingestMessages(ctx context.Context, auth *domain.AuthInfo, svc 
 		bulkCreateDuration = time.Since(bulkCreateStart)
 	}
 
-	extractPhase1Start := time.Now()
-	phase1, err := svc.ingest.ExtractPhase1WithRouting(ctx, req.Messages, chainRoutingTargets(chainAuth))
-	extractPhase1Duration = time.Since(extractPhase1Start)
+	// Concatenate user-role messages' content as the canonical V text.
+	// Assistant-role messages are reply text and don't carry the fact.
+	content := concatUserMessages(req.Messages)
+	if strings.TrimSpace(content) == "" {
+		status = "empty_user_content"
+		return &service.IngestResult{Status: "complete"}, nil
+	}
+
+	storeStart := time.Now()
+	mem, _, keysInserted, rejectedKeys, err := svc.memory.CreateWithAgentKeys(
+		ctx, req.AgentID, req.AppID, content, nil, req.Metadata, req.Keys)
+	storeDuration = time.Since(storeStart)
 	if err != nil {
-		status = "phase1_error"
-		slog.Error("phase1 extraction failed", "session", req.SessionID, "err", err)
-		return nil, fmt.Errorf("phase1 extraction: %w", err)
+		status = "store_kv_error"
+		slog.Error("k=>v store failed", "session", req.SessionID, "err", err)
+		return nil, fmt.Errorf("k=>v store: %w", err)
 	}
-	factsCount = len(phase1.Facts)
-
-	var wg sync.WaitGroup
-	var reconcileResult *service.IngestResult
-	var reconcileErr error
-
-	if !req.DisableSessionSave {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			patchTagsStart := time.Now()
-			defer func() {
-				patchTagsDuration = time.Since(patchTagsStart)
-			}()
-			for i, msg := range req.Messages {
-				tags := tagsAtIndex(phase1.MessageTags, i)
-				if len(tags) == 0 {
-					continue
-				}
-				hash := service.SessionContentHash(req.SessionID, msg.Role, msg.Content, msg.Seq)
-				if err := svc.session.PatchTags(ctx, req.AppID, req.SessionID, hash, tags); err != nil {
-					slog.Warn("session tag patch failed",
-						"cluster_id", auth.ClusterID, "session", req.SessionID, "err", err)
-				}
-			}
-		}()
+	if len(rejectedKeys) > 0 {
+		slog.Info("agent-provided keys partially rejected",
+			"session", req.SessionID,
+			"rejected", len(rejectedKeys))
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		reconcileStart := time.Now()
-		defer func() {
-			reconcileDuration = time.Since(reconcileStart)
-		}()
-		reconcileResult, reconcileErr = svc.ingest.ReconcilePhase2(
-			ctx, auth.AgentName, req.AgentID, req.AppID, req.SessionID, phase1.Facts)
-	}()
-
-	wg.Wait()
-
-	if reconcileErr != nil {
-		status = "reconcile_error"
-		slog.Error("memories reconcile failed", "session", req.SessionID, "err", reconcileErr)
-		return nil, fmt.Errorf("reconcile: %w", reconcileErr)
+	reconcileResult := &service.IngestResult{
+		Status:          "complete",
+		MemoriesChanged: 1,
+		KeysInserted:    keysInserted,
+		KeysRejected:    rejectedKeys,
 	}
-	if reconcileResult != nil {
+	if mem != nil {
+		reconcileResult.InsightIDs = []string{mem.ID}
+	}
+	var reconcileErr error // K=>V doesn't run reconciliation; preserved for shape-compat below
+	_ = reconcileErr
+
+	// svc.memory.Create above is the entire write path now (K=>V replaces
+	// the previous Extract/Reconcile/route pipeline). reconcileResult is
+	// the IngestResult shape preserved for HTTP response compatibility.
+	if reconcileResult.Status != "" {
 		status = reconcileResult.Status
 	}
-	if chainAuth != nil && len(phase1.Facts) > 0 {
-		routeStart := time.Now()
-		routed := s.reconcileRoutedChainFacts(ctx, chainAuth, req, phase1.Facts)
-		routeDuration = time.Since(routeStart)
-		routedChanged = routed.memoriesChanged
-		if reconcileResult == nil {
-			reconcileResult = &service.IngestResult{Status: "complete"}
-		}
-		reconcileResult.MemoriesChanged += routed.memoriesChanged
-		reconcileResult.InsightIDs = append(reconcileResult.InsightIDs, routed.insightIDs...)
-		reconcileResult.Warnings += routed.warnings
-		if reconcileResult.Status == "" {
-			reconcileResult.Status = "complete"
-		}
-	}
-
 	return reconcileResult, nil
+}
+
+// concatUserMessages flattens IngestMessages' user-role content into a
+// single string used as the V's content by the K=>V store path. Assistant
+// turns are skipped (they are reply text, not the fact to remember).
+// System / tool messages are also skipped. Trims whitespace and joins
+// with "\n\n" to keep multi-turn user inputs separable.
+func concatUserMessages(messages []service.IngestMessage) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		if m.Role != "" && m.Role != "user" {
+			continue
+		}
+		t := strings.TrimSpace(m.Content)
+		if t == "" {
+			continue
+		}
+		parts = append(parts, t)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func (s *Server) createSmartContentWithRouting(ctx context.Context, chainAuth *domain.AuthInfo, svc resolvedSvc, routingTargets []service.RoutingTarget, agentName, agentID, appID, sessionID, content string, tags []string, metadata json.RawMessage) (*service.IngestResult, error) {
@@ -685,11 +768,20 @@ type listResponse struct {
 func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 	auth := authInfo(r)
 	q := r.URL.Query()
-	rawQuery := q.Get("q")
+	queries := parseSearchQueries(q)
+	rawQuery := ""
+	if len(queries) > 0 {
+		rawQuery = queries[0]
+	}
 	contentKeywordSearch := isContentKeywordSearch(q)
 	query := strings.TrimSpace(rawQuery)
 	if !contentKeywordSearch {
 		query = normalizeRecallQuery(rawQuery, time.Now())
+		// Normalize the extra facet queries the same way so multi-query
+		// recall sees the same temporal rewriting as single-query.
+		for i := 1; i < len(queries); i++ {
+			queries[i] = normalizeRecallQuery(queries[i], time.Now())
+		}
 	}
 
 	limit, _ := strconv.Atoi(q.Get("limit"))
@@ -711,20 +803,27 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		tags = strings.Split(t, ",")
 	}
 
+	strategy, err := parseRetrievalStrategy(q.Get("retrieval_strategy"))
+	if err != nil {
+		s.handleError(r.Context(), w, err)
+		return
+	}
+
 	filter := domain.MemoryFilter{
-		Query:      query,
-		Tags:       tags,
-		Source:     q.Get("source"),
-		State:      q.Get("state"),
-		MemoryType: q.Get("memory_type"),
-		AgentID:    q.Get("agent_id"),
-		SessionID:  q.Get("session_id"),
-		AppID:      appIDFilter,
-		SortBy:     q.Get("sort_by"),
-		SortDir:    q.Get("sort_dir"),
-		Limit:      limit,
-		Offset:     offset,
-		ScanAll:    parseBoolQuery(q.Get("scanAll")),
+		Query:             query,
+		Tags:              tags,
+		Source:            q.Get("source"),
+		State:             q.Get("state"),
+		MemoryType:        q.Get("memory_type"),
+		AgentID:           q.Get("agent_id"),
+		SessionID:         q.Get("session_id"),
+		AppID:             appIDFilter,
+		SortBy:            q.Get("sort_by"),
+		SortDir:           q.Get("sort_dir"),
+		Limit:             limit,
+		Offset:            offset,
+		ScanAll:           parseBoolQuery(q.Get("scanAll")),
+		RetrievalStrategy: strategy,
 	}
 	onlySession := filter.MemoryType == string(domain.TypeSession)
 
@@ -760,12 +859,29 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 			memories, total, err = s.listLocalMemoriesContentKeyword(r.Context(), svc, filter)
 		case filter.Query != "" && filter.ScanAll:
 			memories, total, err = s.listLocalMemoriesScanAll(r.Context(), svc, filter)
-		case filter.Query != "" && filter.MemoryType == "":
-			memories, total, err = s.defaultConfidenceRecallSearch(r.Context(), auth, svc, filter)
-		case filter.Query != "" && (filter.MemoryType == string(domain.TypeSession) ||
+		case filter.Query != "" && (filter.MemoryType == "" ||
+			filter.MemoryType == string(domain.TypeSession) ||
 			filter.MemoryType == string(domain.TypePinned) ||
 			filter.MemoryType == string(domain.TypeInsight)):
-			memories, total, err = s.singlePoolConfidenceRecallSearch(r.Context(), auth, svc, filter)
+			// Step 4.4: any query-driven search (regardless of memory_type)
+			// routes through svc.memory.Search → recallKV (K=>V path), not
+			// the legacy defaultConfidenceRecallSearch / singlePoolConfidence
+			// pipelines. Those pipelines hit the old memories table and
+			// silently miss data written via the K=>V store path.
+			//
+			// Multi-query (repeated `q` params) takes the quota-merge
+			// variant; the chain / contentKeyword / scanAll branches above
+			// deliberately use only the primary query (documented
+			// limitation — facet recall is a K=>V capability).
+			switch {
+			case len(queries) > maxSearchQueries:
+				err = &domain.ValidationError{Field: "q", Message: fmt.Sprintf("too many queries (max %d)", maxSearchQueries)}
+			case len(queries) > 1:
+				normalized := append([]string{filter.Query}, queries[1:]...)
+				memories, total, err = svc.memory.SearchMulti(r.Context(), filter, normalized)
+			default:
+				memories, total, err = svc.memory.Search(r.Context(), filter)
+			}
 		case onlySession:
 			memories, total, err = svc.session.List(r.Context(), filter)
 		case !onlySession:
@@ -835,6 +951,9 @@ func parseBoolQuery(value string) bool {
 
 const maxAppIDLen = 100
 
+// appIDFromCreateRequest resolves the request's app id. When a caller
+// sends both `appId` and the legacy `app_id`, `appId` deliberately wins
+// — the legacy spelling is only consulted as a fallback.
 func appIDFromCreateRequest(req createMemoryRequest) (string, error) {
 	raw := req.AppID
 	if raw == "" {
@@ -959,6 +1078,64 @@ func collectLocalListPages(
 		}
 		pageFilter.Offset += pageFilter.Limit
 	}
+}
+
+// maxSearchQueries caps the repeated `q` params on one search request.
+// Mirrors the agent's batch tool's effective cap (primary + 4 facet
+// variants) so the two layers agree on the contract.
+const maxSearchQueries = 5
+
+// parseSearchQueries collects every `q` param, trimmed, empties dropped,
+// order-preserving deduped. No cap here: branches that only consume the
+// primary query (chain / content-keyword / scanAll) must keep the old
+// q.Get("q") semantics of silently ignoring extra values, so the
+// maxSearchQueries cap is enforced only where multi-query recall is
+// actually taken (the K=>V search branch).
+func parseSearchQueries(q url.Values) []string {
+	raw := q["q"]
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, r := range raw {
+		t := strings.TrimSpace(r)
+		if t == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+// parseRetrievalStrategy parses the `retrieval_strategy` query param into a
+// uint8 bitmask. Accepts decimal (`31`) or 0x-prefixed hex (`0x1F`). Empty
+// string returns 0, which downstream resolves to tidb.StrategyDefaultV1.
+//
+// Returns a 400-shaped error when the value cannot be parsed or sets bits
+// outside the supported 0x1F mask (KEY_EXACT | KEY_FTS | KEY_VEC | VAL_FTS
+// | VAL_VEC). Locked by the retrieval-strategy contract.
+func parseRetrievalStrategy(value string) (uint8, error) {
+	s := strings.TrimSpace(value)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(s, 0, 8)
+	if err != nil {
+		return 0, &domain.ValidationError{
+			Field:   "retrieval_strategy",
+			Message: "must be an integer (decimal or 0x-prefixed hex) in the range 0..31",
+		}
+	}
+	const maxMask uint64 = 0x1F
+	if n & ^maxMask != 0 {
+		return 0, &domain.ValidationError{
+			Field:   "retrieval_strategy",
+			Message: "bits outside the 0x1F mask (KEY_EXACT|KEY_FTS|KEY_VEC|VAL_FTS|VAL_VEC) are not supported",
+		}
+	}
+	return uint8(n), nil
 }
 
 func normalizeRecallQuery(query string, now time.Time) string {

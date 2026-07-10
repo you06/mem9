@@ -18,6 +18,7 @@ import (
 	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/metrics"
 	"github.com/qiffang/mnemos/server/internal/repository"
+	"github.com/qiffang/mnemos/server/internal/repository/tidb"
 )
 
 const (
@@ -45,6 +46,10 @@ type MemoryService struct {
 	embedder  *embed.Embedder
 	autoModel string
 	ingest    *IngestService
+	// llmClient is captured here for the K=>V experimental path
+	// (memory_kv.go) which calls extractkeys.Extract directly without
+	// going through ingest. Step 4 of the K=>V refactor.
+	llmClient *llm.Client
 }
 
 func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, embedder *embed.Embedder, autoModel string, ingestMode IngestMode) *MemoryService {
@@ -53,96 +58,71 @@ func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, emb
 		embedder:  embedder,
 		autoModel: autoModel,
 		ingest:    NewIngestService(memories, llmClient, embedder, autoModel, ingestMode),
+		llmClient: llmClient,
 	}
 }
 
+// Create stores a memory. Step 4 of the K=>V refactor replaces the old
+// reconciliation pipeline with a direct V/K write path. Behavior change
+// from the previous reconciliation-based implementation:
+//   - Always produces exactly 1 V. Duplicate content (same hash) returns
+//     the existing V's id with count=1.
+//   - The previous "may produce 0 or N insights based on LLM merge
+//     decisions" semantic is gone; dedup is now mechanical via
+//     content_hash.
+//   - LLM is now only used for K (retrieval-key) extraction, not for
+//     content reconciliation/merging.
+//
+// appID threads through to the V row (main gained the appId tenant
+// schema in #350 while the K=>V branch was in flight).
 func (s *MemoryService) Create(ctx context.Context, agentID, appID, content string, tags []string, metadata json.RawMessage) (*domain.Memory, int, error) {
 	if err := validateMemoryInput(content, tags); err != nil {
 		return nil, 0, err
 	}
 
-	if s.ingest == nil {
-		return nil, 0, fmt.Errorf("ingest service not configured")
-	}
-
-	if !s.ingest.HasLLM() {
-		// Keep no-LLM create as a single write so API semantics remain predictable.
-		// This branch intentionally avoids a "create then patch tags/metadata" flow,
-		// which could otherwise return an error after content is already persisted.
-		var embedding []float32
-		if s.autoModel == "" && s.embedder != nil {
-			embeddingResult, embedErr := s.embedder.Embed(ctx, content)
-			if embedErr != nil {
-				return nil, 0, fmt.Errorf("embed raw content: %w", embedErr)
-			}
-			embedding = embeddingResult
-		}
-
-		now := time.Now()
-		mem := &domain.Memory{
-			ID:         uuid.New().String(),
-			Content:    content,
-			Source:     agentID,
-			Tags:       tags,
-			Metadata:   metadata,
-			Embedding:  embedding,
-			MemoryType: domain.TypeInsight,
-			AgentID:    agentID,
-			AppID:      appID,
-			State:      domain.StateActive,
-			Version:    1,
-			UpdatedBy:  agentID,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		}
-		writeStart := time.Now()
-		err := s.memories.Create(ctx, mem)
-		metrics.MemoryWriteDuration.WithLabelValues("create", metricStatus(err)).Observe(time.Since(writeStart).Seconds())
-		if err != nil {
-			return nil, 0, fmt.Errorf("create raw memory: %w", err)
-		}
-		return mem, 1, nil
-	}
-
-	result, err := s.ingest.ReconcileContent(ctx, agentID, agentID, appID, "", []string{content})
+	writeStart := time.Now()
+	mem, err := s.storeKV(ctx, agentID, appID, content, tags, metadata)
+	metrics.MemoryWriteDuration.WithLabelValues("create", metricStatus(err)).Observe(time.Since(writeStart).Seconds())
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("create k=>v memory: %w", err)
+	}
+	return mem, 1, nil
+}
+
+// CreateWithAgentKeys is the same as Create but accepts the agent-
+// provided retrieval keys carried on the wire's `keys` field. When
+// `agentKeys` is non-empty, server-side `extractkeys.Extract` is
+// skipped; the agent keys are validated by `validateAgentKeys` and
+// the survivors written to `memory_keys` with `source = "agent"` /
+// `"agent_translation"` and the agent-specified weight. Locked.
+//
+// Returns the created Memory, the written count (1 unless content_hash
+// dedup hit), the list of accepted-K count + rejected-K reasons, and
+// any error. Caller (handler) surfaces accepted/rejected counts in
+// the sync POST response so the agent can self-correct subsequent
+// stores.
+//
+// When `agentKeys` is empty, behaves identically to `Create` (server-
+// side extractkeys.Extract). The returned rejected list is empty in
+// that case.
+func (s *MemoryService) CreateWithAgentKeys(
+	ctx context.Context,
+	agentID, appID, content string,
+	tags []string,
+	metadata json.RawMessage,
+	agentKeys []RetrievalKey,
+) (*domain.Memory, int, int, []RejectedKey, error) {
+	if err := validateMemoryInput(content, tags); err != nil {
+		return nil, 0, 0, nil, err
 	}
 
-	if result.Status == "failed" {
-		return nil, 0, fmt.Errorf("content reconciliation failed")
+	writeStart := time.Now()
+	mem, accepted, rejected, err := s.storeKVWithAgentKeys(ctx, agentID, appID, content, tags, metadata, agentKeys)
+	metrics.MemoryWriteDuration.WithLabelValues("create_with_keys", metricStatus(err)).Observe(time.Since(writeStart).Seconds())
+	if err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("create_with_agent_keys k=>v memory: %w", err)
 	}
-	if len(result.InsightIDs) == 0 {
-		return nil, 0, nil
-	}
-
-	// Apply user-provided tags/metadata to all created insights.
-	patchWrites := 0
-	for _, id := range result.InsightIDs {
-		mem, err := s.memories.GetByID(ctx, id)
-		if err != nil {
-			continue
-		}
-		if len(tags) > 0 {
-			mem.Tags = tags
-		}
-		if len(metadata) > 0 {
-			mem.Metadata = metadata
-		}
-		if len(tags) > 0 || len(metadata) > 0 {
-			if err := s.memories.UpdateOptimistic(ctx, mem, 0); err == nil {
-				patchWrites++
-			}
-		}
-	}
-
-	latestID := result.InsightIDs[len(result.InsightIDs)-1]
-	mem, getErr := s.memories.GetByID(ctx, latestID)
-	if getErr != nil {
-		return nil, 0, fmt.Errorf("fetch reconciled memory %s: %w", latestID, getErr)
-	}
-	return mem, result.MemoriesChanged + patchWrites, nil
-
+	return mem, 1, accepted, rejected, nil
 }
 
 func (s *MemoryService) CreatePinned(ctx context.Context, agentID, appID, content string, tags []string, metadata json.RawMessage) (*domain.Memory, int, error) {
@@ -178,10 +158,70 @@ func (s *MemoryService) List(ctx context.Context, filter domain.MemoryFilter) ([
 	return finalizeSearchResults(mems, filter.Query), total, nil
 }
 
+// Search retrieves memories. Step 4 of the K=>V refactor replaces all
+// previous search variants (autoHybridSearch / hybridSearch /
+// ftsOnlySearch / keywordOnlySearch) with a single RecallKV path using
+// the V1 default strategy (KEY_EXACT | KEY_FTS | VAL_FTS).
+//
+// Empty-query (list-by-filter) requests still go through the legacy
+// memories.List path — K=>V recall only kicks in when there's a query.
+//
+// API signature unchanged.
 func (s *MemoryService) Search(ctx context.Context, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
 	if filter.Query == "" {
 		return s.List(ctx, filter)
 	}
+
+	slog.Info("memory search (k=>v)", "query_len", len(filter.Query), "retrieval_strategy", filter.RetrievalStrategy)
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	results, err := s.recallKV(ctx, filter.Query, nil, tidb.RetrievalStrategy(filter.RetrievalStrategy), limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	finalized := finalizeSearchResults(results, filter.Query)
+	return finalized, len(finalized), nil
+}
+
+// SearchMulti is the multi-query (facet) variant of Search: the caller
+// supplies several query phrasings (repeated `q` params on the wire)
+// covering different facets of one question; each runs the K=>V recall
+// with a deepened pool and the results are quota-merged so every facet
+// is represented in a bounded shown window. See recallKVMulti for the
+// merge semantics and the motivation.
+//
+// Defensive: zero/one query degrades to the single-query Search path.
+func (s *MemoryService) SearchMulti(ctx context.Context, filter domain.MemoryFilter, queries []string) ([]domain.Memory, int, error) {
+	if len(queries) <= 1 {
+		if len(queries) == 1 {
+			filter.Query = queries[0]
+		}
+		return s.Search(ctx, filter)
+	}
+
+	slog.Info("memory search (k=>v multi)",
+		"query_count", len(queries),
+		"retrieval_strategy", filter.RetrievalStrategy)
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	results, err := s.recallKVMulti(ctx, queries, tidb.RetrievalStrategy(filter.RetrievalStrategy), limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	finalized := finalizeSearchResults(results, strings.Join(queries, " "))
+	return finalized, len(finalized), nil
+}
+
+// searchLegacyDispatch is the pre-step-4 search dispatcher, kept here
+// as dead code for reference / quick rollback during the experimental
+// phase. It is no longer reachable from Search.
+//
+//nolint:unused
+func (s *MemoryService) searchLegacyDispatch(ctx context.Context, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
 	searchFilter := filter
 	searchFilter.SessionID = ""
 	searchFilter.Source = ""

@@ -332,8 +332,10 @@ func TestTiDBCloudProvisioner_InitSchema_ExistingTablesSkipsCreate(t *testing.T)
 	p := NewTiDBCloudProvisioner("http://localhost", "pool", "", 1024, 1536, false)
 	recorder := &schemaInitConnector{
 		existingTables: map[string]bool{
-			"memories": true,
-			"sessions": true,
+			"memories":      true,
+			"sessions":      true,
+			"memory_values": true, // K=>V V table (step 4.2)
+			"memory_keys":   true, // K=>V K table (step 4.2)
 		},
 	}
 	db := sql.OpenDB(recorder)
@@ -352,6 +354,8 @@ func TestTiDBCloudProvisioner_InitSchema_ExistingTablesSkipsCreate(t *testing.T)
 		"ALTER TABLE memories ADD VECTOR INDEX idx_cosine",
 		"ALTER TABLE sessions ADD COLUMN app_id VARCHAR(100) NOT NULL DEFAULT ''",
 		"ALTER TABLE sessions ADD VECTOR INDEX idx_sessions_cosine",
+		"ALTER TABLE memory_values ADD VECTOR INDEX idx_mv_cosine",
+		"ALTER TABLE memory_keys ADD VECTOR INDEX idx_mk_cosine",
 	}
 	for _, want := range wantSubstrings {
 		if !strings.Contains(executed, want) {

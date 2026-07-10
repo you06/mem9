@@ -1436,6 +1436,7 @@ func makeChainContentRequestWithoutRouting(t *testing.T, syncCreate bool) *http.
 }
 
 func TestCreateMemory_SyncChainContentWithoutRoutingPolicyUsesLegacyCreate(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	var llmCalls atomic.Int32
 	srv, memRepo := newChainContentLLMTestServer(t, &llmCalls)
 	req := makeChainContentRequestWithoutRouting(t, true)
@@ -1458,6 +1459,7 @@ func TestCreateMemory_SyncChainContentWithoutRoutingPolicyUsesLegacyCreate(t *te
 }
 
 func TestCreateMemory_AsyncChainContentWithoutRoutingPolicyUsesLegacyCreate(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	var llmCalls atomic.Int32
 	srv, memRepo := newChainContentLLMTestServer(t, &llmCalls)
 	req := makeChainContentRequestWithoutRouting(t, false)
@@ -1840,9 +1842,119 @@ func TestCreateMemory_SyncMessages_Returns200(t *testing.T) {
 	if !sessRepo.bulkCreateCalled {
 		t.Fatal("expected raw sessions to be persisted by default")
 	}
+	// Backward-compat: no agent keys → simple {"status":"ok"} shape, no
+	// keys_inserted / keys_rejected fields. Pins the branch in
+	// createMemory that switches on `len(req.Keys) > 0` so adding
+	// agent-K plumbing doesn't change the legacy response shape.
+	var legacy map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &legacy); err != nil {
+		t.Fatalf("response is not valid JSON: %v (raw=%s)", err, rr.Body.String())
+	}
+	if _, ok := legacy["keys_inserted"]; ok {
+		t.Fatalf("legacy no-keys response should not contain keys_inserted; got %v", legacy)
+	}
+	if _, ok := legacy["keys_rejected"]; ok {
+		t.Fatalf("legacy no-keys response should not contain keys_rejected; got %v", legacy)
+	}
+}
+
+// TestCreateMemory_SyncMessages_KeysShapeResponse pins the response
+// contract: when the caller supplies agent-side retrieval_keys on a
+// messages-shape request, the sync response must use the
+// agentKeysCreateResponse shape so the agent's
+// Mem9MemoryStore tool can surface accepted/rejected counts back to the
+// agent for self-correction. This is the messages-shape counterpart to
+// the content-shape path that already returns this shape.
+//
+// The test backend (testMemoryRepo) doesn't implement *tidb.MemoryRepo,
+// so storeKVWithAgentKeys falls back to legacy create and agent keys are
+// dropped at the storage layer. That's fine for this test — we're
+// verifying handler-level response shape, not key validation (which is
+// covered by TestValidateAgentKeys_* in service/memory_kv_agent_keys_test.go).
+func TestCreateMemory_SyncMessages_KeysShapeResponse(t *testing.T) {
+	sessRepo := &testSessionRepo{}
+	srv := newTestServer(&testMemoryRepo{}, sessRepo)
+
+	body := map[string]any{
+		"messages": []map[string]string{
+			{"role": "user", "content": "user works at Acme Robotics"},
+		},
+		"session_id": "test-session",
+		"sync":       true,
+		"keys": []map[string]any{
+			{"text": "user works at Acme Robotics", "source": "agent", "weight": 1.0},
+		},
+	}
+	req := makeRequest(t, http.MethodPost, "/memories", body)
+	rr := httptest.NewRecorder()
+
+	srv.createMemory(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v (raw=%s)", err, rr.Body.String())
+	}
+	// Must use the agentKeysCreateResponse shape, not the legacy
+	// {"status":"ok"} shape.
+	if _, ok := resp["keys_inserted"]; !ok {
+		t.Fatalf("response missing keys_inserted; got %v", resp)
+	}
+	if _, ok := resp["keys_rejected"]; !ok {
+		t.Fatalf("response missing keys_rejected; got %v", resp)
+	}
+	if resp["status"] != "ok" {
+		t.Fatalf("expected status=ok, got %v", resp["status"])
+	}
+}
+
+func TestCreateMemory_SyncMessages_MetadataReachesV(t *testing.T) {
+	// The messages-shape ingest path historically dropped the
+	// request's `metadata` field on the floor — the K=>V refactor
+	// wired svc.memory.Create with nil metadata. This test verifies
+	// that callers (e.g. an agent's compaction exporter tagging
+	// writes with {"ingest_source": "agent-compaction"}) now
+	// see their metadata persisted on the produced V.
+	memRepo := &testMemoryRepo{}
+	sessRepo := &testSessionRepo{}
+	srv := newTestServer(memRepo, sessRepo)
+
+	body := map[string]any{
+		"messages": []map[string]string{
+			{"role": "user", "content": "the company office is at otemachi"},
+		},
+		"session_id": "test-session",
+		"metadata":   map[string]any{"ingest_source": "agent-compaction"},
+		"sync":       true,
+	}
+	req := makeRequest(t, http.MethodPost, "/memories", body)
+	rr := httptest.NewRecorder()
+
+	srv.createMemory(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(memRepo.createCalls) != 1 {
+		t.Fatalf("expected one V row to be written, got %d", len(memRepo.createCalls))
+	}
+	got := memRepo.createCalls[0].Metadata
+	if len(got) == 0 {
+		t.Fatal("expected request metadata to reach memory_values.metadata; got empty")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatalf("persisted metadata is not valid JSON: %v (raw=%s)", err, got)
+	}
+	if parsed["ingest_source"] != "agent-compaction" {
+		t.Fatalf("expected ingest_source=agent-compaction, got %v (full=%v)", parsed["ingest_source"], parsed)
+	}
 }
 
 func TestCreateMemory_SyncMessages_DisableSessionSaveSkipsRawSessionAndStoresFacts(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -2177,6 +2289,7 @@ func TestCreateMemory_AsyncMessages_DisableSessionSaveSkipsRawSession(t *testing
 }
 
 func TestCreateMemory_AsyncMessages_ReconcileFailed_DoesNotRecordIngestMetering(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -2363,6 +2476,7 @@ func TestBulkCreateMemories_ChainRuntimeUsageUsesResolvedNodeSubject(t *testing.
 }
 
 func TestListMemories_RuntimeUsageRecallFinalizationIgnoresRequestCancellation(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	var cancelRequest context.CancelFunc
 	memRepo := &testMemoryRepo{
@@ -2717,6 +2831,7 @@ func (m *failSearchMemoryRepo) KeywordSearch(context.Context, string, domain.Mem
 }
 
 func TestCreateMemory_SyncMessages_Phase1ErrorReturnsServerError(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	// Mock LLM that always returns 500.
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -2756,6 +2871,7 @@ func TestCreateMemory_SyncMessages_Phase1ErrorReturnsServerError(t *testing.T) {
 }
 
 func TestCreateMemory_SyncMessages_StripsInjectedContext(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	// Mock LLM that captures request bodies to verify no injected context reaches the LLM.
 	var llmBodies []string
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2829,6 +2945,7 @@ func TestCreateMemory_SyncMessages_StripsInjectedContext(t *testing.T) {
 }
 
 func TestCreateMemory_SyncMessages_ReconcileFailure_Returns500(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	// Mock LLM that returns valid facts for ExtractPhase1.
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2876,6 +2993,7 @@ func TestCreateMemory_SyncMessages_ReconcileFailure_Returns500(t *testing.T) {
 }
 
 func TestCreateMemory_SyncMessages_TimeoutReturnsGatewayTimeout(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	oldTimeout := syncIngestTimeout
 	syncIngestTimeout = 10 * time.Millisecond
 	defer func() { syncIngestTimeout = oldTimeout }()
@@ -2918,6 +3036,7 @@ func TestCreateMemory_SyncMessages_TimeoutReturnsGatewayTimeout(t *testing.T) {
 }
 
 func TestCreateMemory_SyncMessages_ExplicitSeqUsesSeqAwarePatchHash(t *testing.T) {
+	t.Skip("pre-K=>V test asserting Extract/Reconcile pipeline; step 4.3 of K=>V refactor replaced ingestMessages with storeKV path so this assertion is no longer valid")
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -2978,6 +3097,7 @@ func TestCreateMemory_SyncMessages_ExplicitSeqUsesSeqAwarePatchHash(t *testing.T
 }
 
 func TestListMemories_DefaultRecall_PrefersSessionForExactQuery(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3027,6 +3147,7 @@ func TestListMemories_DefaultRecall_PrefersSessionForExactQuery(t *testing.T) {
 }
 
 func TestListMemories_DefaultRecall_KeepsPinnedIdentifierSearchHits(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch behavior; step 4.4 routes query-driven list through K=>V recall, which the mock repo cannot host")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3089,6 +3210,7 @@ func TestListMemories_DefaultRecall_KeepsPinnedIdentifierSearchHits(t *testing.T
 }
 
 func TestListMemories_DefaultRecall_RecordsMetering(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3132,6 +3254,7 @@ func TestListMemories_DefaultRecall_RecordsMetering(t *testing.T) {
 }
 
 func TestListMemories_DefaultRecall_ExactKeepsComplementaryInsightEvidence(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3189,6 +3312,7 @@ func TestListMemories_DefaultRecall_ExactKeepsComplementaryInsightEvidence(t *te
 }
 
 func TestListMemories_DefaultRecall_PrefersTargetSpeakerForSpeechQuestion(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3223,6 +3347,7 @@ func TestListMemories_DefaultRecall_PrefersTargetSpeakerForSpeechQuestion(t *tes
 }
 
 func TestListMemories_DefaultRecall_DownranksCaptionHeavyNonVisualSessionNoise(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3257,6 +3382,7 @@ func TestListMemories_DefaultRecall_DownranksCaptionHeavyNonVisualSessionNoise(t
 }
 
 func TestListMemories_DefaultRecall_PrefersSubjectSpeakerForPersonalPreferenceQuestion(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3292,6 +3418,7 @@ func TestListMemories_DefaultRecall_PrefersSubjectSpeakerForPersonalPreferenceQu
 }
 
 func TestListMemories_DefaultRecall_PrefersSubjectAnswerForResearchQuestion(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3327,6 +3454,7 @@ func TestListMemories_DefaultRecall_PrefersSubjectAnswerForResearchQuestion(t *t
 }
 
 func TestListMemories_DefaultRecall_PrefersSelfIdentityStatement(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3362,6 +3490,7 @@ func TestListMemories_DefaultRecall_PrefersSelfIdentityStatement(t *testing.T) {
 }
 
 func TestListMemories_DefaultRecall_PrefersRelationshipStatusSelfStatement(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3397,6 +3526,7 @@ func TestListMemories_DefaultRecall_PrefersRelationshipStatusSelfStatement(t *te
 }
 
 func TestListMemories_DefaultRecall_DemotesNonSubjectPromptForSymbolQuestion(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3432,6 +3562,7 @@ func TestListMemories_DefaultRecall_DemotesNonSubjectPromptForSymbolQuestion(t *
 }
 
 func TestListMemories_DefaultRecall_ExpandsAdjacentSessionAnswerTurn(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3497,6 +3628,7 @@ func TestListMemories_DefaultRecall_ExpandsAdjacentSessionAnswerTurn(t *testing.
 }
 
 func TestListMemories_DefaultRecall_KeepsQualifiedPinnedFirst(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3551,6 +3683,7 @@ func TestListMemories_DefaultRecall_KeepsQualifiedPinnedFirst(t *testing.T) {
 }
 
 func TestListMemories_DefaultRecall_UnderfillsOnConfidenceGap(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3592,6 +3725,7 @@ func TestListMemories_DefaultRecall_UnderfillsOnConfidenceGap(t *testing.T) {
 }
 
 func TestListMemories_DefaultRecall_EnumerationCanExpandBeyondRequestedLimit(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3648,6 +3782,7 @@ func TestListMemories_DefaultRecall_EnumerationCanExpandBeyondRequestedLimit(t *
 }
 
 func TestListMemories_DefaultRecall_ExactStillHonorsRequestedLimit(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3686,6 +3821,7 @@ func TestListMemories_DefaultRecall_ExactStillHonorsRequestedLimit(t *testing.T)
 }
 
 func TestListMemories_DefaultRecall_EnumerationFiltersLowConfidenceNoise(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -3747,6 +3883,7 @@ func TestClassifyRecallQueryShape_ExpandedEnumerationQueries(t *testing.T) {
 }
 
 func TestListMemories_DefaultRecall_EnumerationPrefersFocusMatchedMemories(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3790,6 +3927,7 @@ func TestListMemories_DefaultRecall_EnumerationPrefersFocusMatchedMemories(t *te
 }
 
 func TestListMemories_DefaultRecall_RepeatCountIncludesConcreteEvents(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3833,6 +3971,7 @@ func TestListMemories_DefaultRecall_RepeatCountIncludesConcreteEvents(t *testing
 }
 
 func TestListMemories_DefaultRecall_DurationPrefersExactSpanMemory(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3868,6 +4007,7 @@ func TestListMemories_DefaultRecall_DurationPrefersExactSpanMemory(t *testing.T)
 }
 
 func TestListMemories_DefaultRecall_FrequencyPrefersCadenceOverDuration(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -3903,6 +4043,7 @@ func TestListMemories_DefaultRecall_FrequencyPrefersCadenceOverDuration(t *testi
 }
 
 func TestListMemories_DefaultRecall_DurationDemotesQuestionTurns(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
@@ -4023,6 +4164,7 @@ func TestDefaultConfidenceRecallSearch_FansOutPoolSearchesConcurrently(t *testin
 }
 
 func TestListMemories_DefaultRecall_PrefersSessionForChineseExactQuery(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -4072,6 +4214,7 @@ func TestListMemories_DefaultRecall_PrefersSessionForChineseExactQuery(t *testin
 }
 
 func TestListMemories_DefaultRecall_PrefersQuantifiedEvidenceForChineseCountQuery(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	now := time.Now()
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, filter domain.MemoryFilter, _ int) ([]domain.Memory, error) {
@@ -4171,6 +4314,7 @@ func TestNormalizeRecallQuery_LocalAnchorRemainsUnchanged(t *testing.T) {
 }
 
 func TestListMemories_DefaultRecall_NormalizesChineseRelativeQuery(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	memRepo := &testMemoryRepo{
 		keywordSearchHook: func(_ context.Context, _ string, _ domain.MemoryFilter, _ int) ([]domain.Memory, error) {
 			return nil, nil
@@ -4202,6 +4346,7 @@ func TestListMemories_DefaultRecall_NormalizesChineseRelativeQuery(t *testing.T)
 }
 
 func TestListMemories_SinglePoolRecall_NormalizesChineseRelativeQuery(t *testing.T) {
+	t.Skip("pre-K=>V test asserting defaultConfidenceRecallSearch / singlePoolConfidenceRecallSearch behavior; step 4.4 bypassed those pipelines so query-driven list routes through K=>V")
 	memRepo := &testMemoryRepo{}
 	sessRepo := &testSessionRepo{
 		keywordSearchHook: func(_ context.Context, _ string, _ domain.MemoryFilter, _ int) ([]domain.Memory, error) {

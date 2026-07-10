@@ -46,6 +46,23 @@ type IngestRequest struct {
 	AppID              string          `json:"appId,omitempty"`
 	Mode               IngestMode      `json:"mode"`
 	DisableSessionSave bool            `json:"disableSessionSave,omitempty"`
+	// Metadata is the caller-supplied JSON metadata blob that travels
+	// through the messages-shape ingest path and lands on the produced
+	// V's `memory_values.metadata` column. The content-shape ingest
+	// path (handler/memory.go's content branch) already plumbed
+	// metadata; this field closes the same gap on the messages-shape
+	// branch so callers like the agent's compaction exporter can tag
+	// each write with `{"ingest_source": "..."}` etc.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+	// Keys is an optional list of agent-provided retrieval keys for the
+	// memory the ingest is about to create. When non-empty, the K=>V
+	// path uses these (after validation) instead of running the
+	// server-side extractkeys.Extract LLM call: agent has better
+	// context to pick K
+	// than mem9 server does, but mem9 still enforces quality guards
+	// (stop-list, entity overlap, length caps) on whatever the agent
+	// sends.
+	Keys []RetrievalKey `json:"keys,omitempty"`
 }
 
 // IngestMessage represents a single conversation message.
@@ -55,7 +72,30 @@ type IngestMessage struct {
 	Seq     *int   `json:"seq,omitempty"`
 }
 
+// RetrievalKey is one agent-provided retrieval key carried on
+// IngestRequest.Keys. Wire shape (snake_case JSON) is locked.
+//
+// `source` MUST be one of extractkeys.SourceAgent or
+// SourceAgentTranslation; other values are rejected at validation
+// time (server-side enums "extract" / "extract_translation" / "user"
+// / "feedback" are reserved for non-agent paths and can't be
+// impersonated by clients).
+//
+// `weight` is the per-key retrieval weight (default 1.0 server-side
+// when missing / zero, rejected below 0.1, clamped above 2.0).
+type RetrievalKey struct {
+	Text   string  `json:"text"`
+	Source string  `json:"source"`
+	Weight float64 `json:"weight,omitempty"`
+}
+
 // IngestResult is the output of the ingest pipeline.
+//
+// KeysInserted / KeysRejected are populated when the request supplied
+// agent-side retrieval keys (IngestRequest.Keys). Both fields stay at
+// zero / nil for legacy callers that don't send keys. Carrying them
+// here lets messages-shape clients (the agent's Mem9MemoryStore) close
+// the self-correction loop without a separate endpoint.
 type IngestResult struct {
 	Status          string         `json:"status"`           // complete | partial | failed
 	MemoriesChanged int            `json:"memories_changed"` // count of ADD + UPDATE actions executed
@@ -63,6 +103,8 @@ type IngestResult struct {
 	Changes         []MemoryChange `json:"changes,omitempty"`
 	Warnings        int            `json:"warnings,omitempty"`
 	Error           string         `json:"error,omitempty"`
+	KeysInserted    int            `json:"keys_inserted,omitempty"`
+	KeysRejected    []RejectedKey  `json:"keys_rejected,omitempty"`
 }
 
 const (
